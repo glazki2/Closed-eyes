@@ -900,7 +900,11 @@ KHook::Return<int64> Hook_TakeDamage(CBaseEntity* pThis, CTakeDamageInfo* pInfo,
 {
 	if (!g_bAnyGhostState)
 		return {KHook::Action::Ignore, 0};
-	if (IsGhostPawn(GetSlotFromPawnEntity(pThis)))
+	int iVictim = GetSlotFromPawnEntity(pThis);
+	// our own silent suicide (!unghost, round end) must go through
+	if (IsValidSlot(iVictim) && g_Ghost[iVictim].bSilentDeath)
+		return {KHook::Action::Ignore, 0};
+	if (IsGhostPawn(iVictim))
 		return {KHook::Action::Supersede, 1};
 	if (pInfo && IsGhostPawn(GetSlotFromPawnEntity(pInfo->m_hAttacker().Get())))
 		return {KHook::Action::Supersede, 1};
