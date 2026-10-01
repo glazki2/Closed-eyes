@@ -39,6 +39,7 @@ private:
 	const char* GetLogTag();
 private:
 	void OnPostEvent(CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCount, const uint64* clients, INetworkMessageInternal* pEvent, const CNetMessage* pData, unsigned long nSize, NetChannelBufType_t bufType);
+	bool OnFireEvent(IGameEvent* pEvent, bool bDontBroadcast);
 };
 
 #endif //_INCLUDE_METAMOD_SOURCE_STUB_PLUGIN_H_
