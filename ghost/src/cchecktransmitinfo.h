@@ -1,8 +1,5 @@
 #pragma once
 
-// Taken from CS2Fixes (src/cs2_sdk/cchecktransmitinfo.h), GPLv3.
-// Layout reversed by Wend4r: https://github.com/Wend4r/sourcesdk/blob/main/public/iservernetworkable.h
-
 #include "bitvec.h"
 #include "eiface.h"
 #include "playerslot.h"

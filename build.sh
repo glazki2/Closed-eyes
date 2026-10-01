@@ -5,13 +5,13 @@
 # (например, Ubuntu 24.04 с glibc 2.39), Metamod загрузить не сможет: в `meta list` будет <ERROR>.
 # Поэтому собираем clang'ом с sysroot из пакетов Ubuntu 20.04 (glibc 2.31, libstdc++ из GCC 10).
 #
-# Нужны: git, python3, pip, clang, curl, dpkg-deb, zip, binutils.
+# Нужны: git, python3, pip, clang, lld, curl, dpkg-deb, zip, binutils.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DEPS="${DEPS:-$ROOT/.deps}"
-HL2SDK_REV="${HL2SDK_REV:-22087f5}"   # alliedmodders/hl2sdk, ветка cs2
-MMS_REV="${MMS_REV:-7ec0f16}"         # alliedmodders/metamod-source, последний коммит с SourceHook (до KHook)
+HL2SDK_REV="${HL2SDK_REV:-22087f5}"   # hl2sdk, ветка cs2
+MMS_REV="${MMS_REV:-05c5c63}"         # metamod-source 2.0 (KHook, plugin API 18)
 UBUNTU_MIRROR="${UBUNTU_MIRROR:-http://archive.ubuntu.com/ubuntu}"
 MAX_GLIBC="2.31"
 
@@ -70,7 +70,9 @@ git -C hl2sdk-cs2 checkout -q "$HL2SDK_REV"
 if [ ! -d metamod-source ]; then
   git clone --filter=blob:none https://github.com/alliedmodders/metamod-source metamod-source
 fi
+git -C metamod-source fetch -q origin || true
 git -C metamod-source checkout -q "$MMS_REV"
+git -C metamod-source submodule update --init --depth 1 -q
 
 if ! python3 -c "import ambuild2" 2>/dev/null; then
   [ -d ambuild ] || git clone -q --depth 1 https://github.com/alliedmodders/ambuild ambuild
@@ -84,27 +86,26 @@ cd "$ROOT/build"
 CC="$DEPS/toolchain/clang" CXX="$DEPS/toolchain/clang++" python3 "$ROOT/ghost/configure.py" \
   --hl2sdk-root "$DEPS" \
   --mms_path "$DEPS/metamod-source" \
-  --hl2sdk-manifests "$ROOT/ghost/hl2sdk-manifests" \
+  --hl2sdk-manifests "$DEPS/metamod-source/hl2sdk-manifests" \
   --sdks cs2 --targets x86_64 --enable-optimize
 ambuild
 
-cd package
-strip --strip-debug addons/ghost/ghost.so
+cd package/cs2
+SO=addons/ghost/bin/linuxsteamrt64/ghost.so
+strip --strip-debug "$SO"
 
 # --- проверка: не требовать glibc новее, чем в Steam Runtime sniper ---
-NEED="$(objdump -T addons/ghost/ghost.so | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -Vu | tail -1)"
+NEED="$(objdump -T "$SO" | grep -oE 'GLIBC_[0-9.]+' | sed 's/GLIBC_//' | sort -Vu | tail -1)"
 if [ "$(printf '%s\n%s\n' "$NEED" "$MAX_GLIBC" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
   echo "ОШИБКА: ghost.so требует GLIBC_$NEED, а в CS2 (Steam Runtime sniper) только $MAX_GLIBC" >&2
   exit 1
 fi
-if objdump -T addons/ghost/ghost.so | grep -qE 'GLIBCXX_|CXXABI_'; then
+if objdump -T "$SO" | grep -qE 'GLIBCXX_|CXXABI_'; then
   echo "ОШИБКА: ghost.so зависит от системного libstdc++, нужен -static-libstdc++" >&2
   exit 1
 fi
 echo "glibc: максимум GLIBC_$NEED (нужно <= $MAX_GLIBC) — OK"
 
-mkdir -p addons/configs
-cp "$ROOT/ghost/configs/ghost.ini" addons/configs/
 rm -f "$ROOT/build/ghost-linux-x86_64.zip"
 zip -qr "$ROOT/build/ghost-linux-x86_64.zip" addons
 echo "Готово: $ROOT/build/ghost-linux-x86_64.zip"

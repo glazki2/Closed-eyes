@@ -83,7 +83,7 @@ class CPlayerPawnComponent
 	virtual void unk_15() = 0;
 	virtual void unk_16() = 0;
 	virtual void unk_17() = 0;
-	// С текущим билдом (libserver.so 0f28e3d6) их 22, как в CS2Fixes 1.19.
+	// С текущим билдом (libserver.so 0f28e3d6) их 22.
 	// Было 17 — из-за этого CCSPlayer_ItemServices::GiveNamedItem вызывался
 	// из слота 21 вместо 26 и оружие не выдавалось.
 	// Проверено по vtable CCSPlayer_ItemServices: 24 и 26 — выдача предмета
@@ -274,7 +274,7 @@ public:
 	SCHEMA_FIELD(bool, m_bHasDefuser);
 	SCHEMA_FIELD(bool, m_bHasHelmet);
 
-	// CCSPlayer_ItemServices::StripPlayerWeapons(bool removeSuit), see CS2Fixes services.h:
+	// CCSPlayer_ItemServices::StripPlayerWeapons(bool removeSuit):
 	// 2 dtor slots + 22 CPlayerPawnComponent slots + _GiveNamedItem, GiveNamedItemBool, GiveNamedItem, DropActiveWeapon
 	void RemoveWeapons(bool bRemoveSuit = true)
 	{

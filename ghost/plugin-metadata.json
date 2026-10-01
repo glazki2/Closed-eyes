@@ -1,0 +1,11 @@
+{
+    "name": "ghost",
+    "alias": "ghost",
+    "display_name": "Ghost",
+    "description": "Ghost mode for dead players",
+    "author": "glazki2",
+    "url": "https://github.com/glazki2/Closed-eyes",
+    "log_tag": "GHOST",
+    "license": "GPL",
+    "version": "3.0.0"
+}

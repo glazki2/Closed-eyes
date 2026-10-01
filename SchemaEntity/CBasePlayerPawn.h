@@ -4,7 +4,6 @@
 #include "CBaseModelEntity.h"
 #include "services.h"
 
-// Restored from CS2Fixes (src/cs2_sdk/entity/cbaseplayerpawn.h), trimmed to schema fields.
 class CBasePlayerController;
 
 class CBasePlayerPawn : public CBaseModelEntity
