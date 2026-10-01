@@ -1,9 +1,9 @@
 {
-    "name": "cs2",
-    "env_var": "HL2SDKCS2",
-    "extension": "2.cs2",
-    "code": 25,
-    "define": "CS2",
+    "name": "dota",
+    "env_var": "HL2SDKDOTA",
+    "extension": "2.dota",
+    "code": 24,
+    "define": "DOTA",
     "platforms": {
         "windows": [
             "x86_64"

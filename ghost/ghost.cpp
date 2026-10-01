@@ -36,6 +36,7 @@ struct GhostState
 	float flCooldownUntil;
 	uint64_t nSavedInteractsAs;
 	bool bSavedCollision;
+	bool bPendingRestore; // ghost visuals stay on the pawn until the next real spawn
 };
 
 GhostState g_Ghost[MAX_SLOTS];
@@ -59,6 +60,8 @@ CTimer* g_pReapplyTimer = nullptr;
 
 inline bool IsValidSlot(int iSlot) { return iSlot >= 0 && iSlot < MAX_SLOTS; }
 inline bool IsGhost(int iSlot) { return IsValidSlot(iSlot) && g_Ghost[iSlot].bActive; }
+// Pawn still carries ghost state (round end, until the next real spawn): keep it silent and harmless.
+bool IsGhostPawn(int iSlot);
 
 // Returns slot of the player owning this pawn or -1 if the entity is not a player pawn.
 int GetSlotFromPawnEntity(CEntityInstance* pEnt)
@@ -143,7 +146,7 @@ void StripButtons(CSGOUserCmdPB* pCmd)
 
 void* ProcessUsercmds(CCSPlayerController* pController, CUserCmd* cmds, int numcmds, bool paused, float margin)
 {
-	if(pController && IsGhost(pController->GetPlayerSlot()))
+	if(pController && IsGhostPawn(pController->GetPlayerSlot()))
 	{
 		int iStride = g_iUserCmdSize > 0 ? g_iUserCmdSize : (int)(g_iUserCmdPbOffset + sizeof(CSGOUserCmdPB) + 0x38);
 		for(int i = 0; i < numcmds; i++)
@@ -162,7 +165,7 @@ CBaseEntity* (*UTIL_FindUseEntity)(CCSPlayer_UseServices* pThis, float flUnk, in
 CBaseEntity* FindUseEntity(CCSPlayer_UseServices* pThis, float flUnk, int64_t nUnk)
 {
 	CCSPlayerPawn* pPawn = pThis ? ((CPlayerPawnComponent*)pThis)->GetPawn() : nullptr;
-	if(pPawn && IsGhost(GetSlotFromPawnEntity(pPawn))) return nullptr;
+	if(pPawn && IsGhostPawn(GetSlotFromPawnEntity(pPawn))) return nullptr;
 	return UTIL_FindUseEntity(pThis, flUnk, nUnk);
 }
 
@@ -182,6 +185,7 @@ void StartupServer()
 	g_pGameEntitySystem = GameEntitySystem();
 	g_pEntitySystem = g_pUtils->GetCEntitySystem();
 	gpGlobals = g_pUtils->GetCGlobalVars();
+	g_ghost.HookGameEvents();
 }
 
 // Footsteps / jump / land sounds of a ghost are not sent to anyone else.
@@ -194,7 +198,7 @@ void ghost::OnPostEvent(CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCoun
 
 	auto msg = const_cast<CNetMessage*>(pData)->ToPB<CMsgSosStartSoundEvent>();
 	int iSlot = GetSlotFromPawnEntity(UTIL_GetEntityByIndex(msg->source_entity_index()));
-	if(!IsGhost(iSlot)) RETURN_META(MRES_IGNORED);
+	if(!IsGhostPawn(iSlot)) RETURN_META(MRES_IGNORED);
 
 	// keep the sound only for the ghost himself
 	uint64* pClients = const_cast<uint64*>(clients);
@@ -203,30 +207,23 @@ void ghost::OnPostEvent(CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCoun
 	RETURN_META(MRES_HANDLED);
 }
 
-// Entering/leaving ghost mode must not look like a new life / death for other plugins and the kill feed.
+// Entering/leaving ghost mode is not sent to clients: no kill feed entry, no spawn notice.
+// The event is not freed/superseded here: other pre-hooks may still use it.
 bool ghost::OnFireEvent(IGameEvent* pEvent, bool bDontBroadcast)
 {
-	if(!pEvent) RETURN_META_VALUE(MRES_IGNORED, false);
+	if(!pEvent || bDontBroadcast) RETURN_META_VALUE(MRES_IGNORED, false);
 	const char* szName = pEvent->GetName();
+	bool bHide = false;
 	if(!strcmp(szName, "player_death"))
 	{
 		int iSlot = pEvent->GetInt("userid");
-		if(IsValidSlot(iSlot) && g_Ghost[iSlot].bSilentDeath)
-		{
-			g_Ghost[iSlot].bSilentDeath = false;
-			g_pGameEventManager->FreeEvent(pEvent);
-			RETURN_META_VALUE(MRES_SUPERCEDE, true);
-		}
+		bHide = IsValidSlot(iSlot) && g_Ghost[iSlot].bSilentDeath;
 	}
 	else if(!strcmp(szName, "player_spawn"))
-	{
-		int iSlot = pEvent->GetInt("userid");
-		if(IsGhost(iSlot))
-		{
-			g_pGameEventManager->FreeEvent(pEvent);
-			RETURN_META_VALUE(MRES_SUPERCEDE, true);
-		}
-	}
+		bHide = IsGhost(pEvent->GetInt("userid"));
+
+	if(bHide)
+		RETURN_META_VALUE_NEWPARAMS(MRES_IGNORED, false, &IGameEventManager2::FireEvent, (pEvent, true));
 	RETURN_META_VALUE(MRES_IGNORED, false);
 }
 
@@ -265,7 +262,8 @@ void ApplyGhost(int iSlot)
 	}
 
 	// Invisible, no shadow
-	pPawn->m_flShadowStrength() = 0.0f;
+	if(pPawn->m_flShadowStrength() != 0.0f)
+		pPawn->m_flShadowStrength = 0.0f;
 	if((pPawn->m_fEffects() & (EF_NODRAW | EF_NOSHADOW)) != (EF_NODRAW | EF_NOSHADOW))
 		pPawn->m_fEffects = pPawn->m_fEffects() | EF_NODRAW | EF_NOSHADOW;
 	if(pPawn->m_nRenderMode() != kRenderNone)
@@ -274,7 +272,8 @@ void ApplyGhost(int iSlot)
 		pPawn->m_clrRender = Color(255, 255, 255, 0);
 
 	// Dead for the game: round end counting, scoreboard, radar, chat/voice
-	pPawn->m_lifeState() = LifeState_t::LIFE_DYING;
+	if(pPawn->m_lifeState() != LifeState_t::LIFE_DYING)
+		pPawn->m_lifeState = LifeState_t::LIFE_DYING;
 }
 
 void RestorePawn(int iSlot)
@@ -289,7 +288,7 @@ void RestorePawn(int iSlot)
 		pPawn->m_pCollision()->m_collisionAttribute().m_nInteractsAs = g_Ghost[iSlot].nSavedInteractsAs;
 		g_pUtils->CollisionRulesChanged(pPawn);
 	}
-	pPawn->m_flShadowStrength() = 1.0f;
+	pPawn->m_flShadowStrength = 1.0f;
 	pPawn->m_fEffects = pPawn->m_fEffects() & ~(uint32)(EF_NODRAW | EF_NOSHADOW);
 	pPawn->m_nRenderMode = kRenderNormal;
 	pPawn->m_clrRender = Color(255, 255, 255, 255);
@@ -303,25 +302,40 @@ void ResetSlot(int iSlot)
 	g_Ghost[iSlot].bActive = false;
 	g_Ghost[iSlot].bSavedCollision = false;
 	g_Ghost[iSlot].bSilentDeath = false;
+	g_Ghost[iSlot].bPendingRestore = false;
 }
 
-// Leave ghost mode: player is dead again, silently.
-void RemoveGhost(int iSlot, bool bKill)
+bool IsGhostPawn(int iSlot)
+{
+	return IsValidSlot(iSlot) && (g_Ghost[iSlot].bActive || g_Ghost[iSlot].bPendingRestore);
+}
+
+// Leave ghost mode and kill the pawn silently: player is dead again.
+void RemoveGhost(int iSlot)
 {
 	if(!IsGhost(iSlot)) return;
-	RestorePawn(iSlot);
 	g_Ghost[iSlot].bActive = false;
-	g_Ghost[iSlot].bSavedCollision = false;
-	if(!bKill) return;
 
 	CCSPlayerController* pController = CCSPlayerController::FromSlot(iSlot);
-	if(!pController) return;
-	CCSPlayerPawn* pPawn = pController->GetPlayerPawn();
-	if(!pPawn) return;
-	pPawn->m_lifeState() = LifeState_t::LIFE_ALIVE;
-	g_Ghost[iSlot].bSilentDeath = true;
-	g_pPlayers->CommitSuicide(iSlot, false, true);
-	g_Ghost[iSlot].bSilentDeath = false;
+	CCSPlayerPawn* pPawn = pController ? pController->GetPlayerPawn() : nullptr;
+	if(pPawn)
+	{
+		pPawn->m_lifeState = LifeState_t::LIFE_ALIVE;
+		g_Ghost[iSlot].bSilentDeath = true;
+		g_pPlayers->CommitSuicide(iSlot, false, true);
+		g_Ghost[iSlot].bSilentDeath = false;
+	}
+	RestorePawn(iSlot);
+	g_Ghost[iSlot].bSavedCollision = false;
+}
+
+// Stop ghost logic but keep the pawn hidden and "dead" until the game respawns it
+// (round end): no kill, no death in stats.
+void DeactivateGhost(int iSlot)
+{
+	if(!IsGhost(iSlot)) return;
+	g_Ghost[iSlot].bActive = false;
+	g_Ghost[iSlot].bPendingRestore = true;
 }
 
 void MakeGhost(int iSlot)
@@ -340,6 +354,11 @@ void MakeGhost(int iSlot)
 		if(!g_szModel.empty()) g_pUtils->SetEntityModel(pPawn, g_szModel.c_str());
 		ApplyGhost(iSlot);
 	});
+	// spawn finishes over a few ticks (loadout, lifeState): apply once more
+	g_pUtils->CreateTimer(0.25f, [iSlot]() {
+		if(IsGhost(iSlot)) ApplyGhost(iSlot);
+		return -1.0f;
+	});
 }
 
 ///////////////////////////////////////
@@ -353,7 +372,7 @@ bool OnGhostCommand(int iSlot, const char* szContent)
 
 	if(IsGhost(iSlot))
 	{
-		RemoveGhost(iSlot, true);
+		RemoveGhost(iSlot);
 		return false;
 	}
 
@@ -377,7 +396,7 @@ bool OnGhostCommand(int iSlot, const char* szContent)
 
 bool OnUnGhostCommand(int iSlot, const char* szContent)
 {
-	if(IsGhost(iSlot)) RemoveGhost(iSlot, true);
+	if(IsGhost(iSlot)) RemoveGhost(iSlot);
 	return false;
 }
 
@@ -386,7 +405,7 @@ bool OnGhostOffCommand(int iSlot, const char* szContent)
 	if(iSlot != -1) return false; // server console only
 	g_bEnabled = !g_bEnabled;
 	if(!g_bEnabled)
-		for(int i = 0; i < MAX_SLOTS; i++) RemoveGhost(i, true);
+		for(int i = 0; i < MAX_SLOTS; i++) RemoveGhost(i);
 	Msg("[Ghost] %s\n", g_bEnabled ? "enabled" : "disabled");
 	return false;
 }
@@ -394,25 +413,31 @@ bool OnGhostOffCommand(int iSlot, const char* szContent)
 ///////////////////////////////////////
 // Events
 
-void RemoveAllGhosts(bool bKill)
-{
-	for(int i = 0; i < MAX_SLOTS; i++)
-	{
-		if(IsGhost(i)) RemoveGhost(i, bKill);
-		ResetSlot(i);
-	}
-}
-
 void OnRoundStart(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 {
 	g_bRoundActive = true;
-	RemoveAllGhosts(false);
+	// normally already restored on player_spawn; catch anything left over
+	for(int i = 0; i < MAX_SLOTS; i++)
+	{
+		if(IsGhost(i)) DeactivateGhost(i);
+		if(g_Ghost[i].bPendingRestore)
+		{
+			CCSPlayerController* pController = CCSPlayerController::FromSlot(i);
+			CCSPlayerPawn* pPawn = pController ? pController->GetPlayerPawn() : nullptr;
+			if(pPawn && pPawn->IsAlive())
+			{
+				RestorePawn(i);
+				ResetSlot(i);
+			}
+			// otherwise stays pending: restored on this player's next player_spawn
+		}
+	}
 }
 
 void OnRoundEnd(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 {
 	g_bRoundActive = false;
-	RemoveAllGhosts(true);
+	for(int i = 0; i < MAX_SLOTS; i++) DeactivateGhost(i);
 }
 
 void OnPlayerLeaveGhost(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
@@ -427,29 +452,39 @@ void OnPlayerLeaveGhost(const char* szName, IGameEvent* pEvent, bool bDontBroadc
 	}
 	if(!strcmp(szName, "player_death"))
 	{
-		ResetSlot(iSlot);
+		// keep bSilentDeath: our own FireEvent hook may run after this callback
+		g_Ghost[iSlot].bActive = false;
 		return;
 	}
 	// player_team
-	if(IsGhost(iSlot)) RemoveGhost(iSlot, false);
+	if(IsGhost(iSlot)) RemoveGhost(iSlot);
 	ResetSlot(iSlot);
 }
 
 // Other plugins (NoBlock, skins) touch the pawn on spawn: re-apply after them.
+// A real spawn of a former ghost restores the normal look.
 void OnPlayerSpawn(const char* szName, IGameEvent* pEvent, bool bDontBroadcast)
 {
 	int iSlot = pEvent->GetInt("userid");
-	if(!IsGhost(iSlot)) return;
+	if(!IsValidSlot(iSlot)) return;
+	if(!IsGhost(iSlot) && !g_Ghost[iSlot].bPendingRestore) return;
 	g_pUtils->NextFrame([iSlot]() {
-		if(IsGhost(iSlot)) ApplyGhost(iSlot);
+		if(IsGhost(iSlot))
+			ApplyGhost(iSlot);
+		else if(g_Ghost[iSlot].bPendingRestore)
+		{
+			RestorePawn(iSlot);
+			g_Ghost[iSlot].bPendingRestore = false;
+			g_Ghost[iSlot].bSavedCollision = false;
+		}
 	});
 }
 
 bool OnTakeDamagePre(int iSlot, CTakeDamageInfo *pInfo)
 {
-	if(IsGhost(iSlot)) return false;
+	if(IsGhostPawn(iSlot)) return false;
 	int iAttackerSlot = GetSlotFromPawnEntity(pInfo->m_hAttacker().Get());
-	if(IsGhost(iAttackerSlot)) return false;
+	if(IsGhostPawn(iAttackerSlot)) return false;
 	return true;
 }
 
@@ -516,7 +551,8 @@ bool ghost::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool la
 
 bool ghost::Unload(char *error, size_t maxlen)
 {
-	for(int i = 0; i < MAX_SLOTS; i++) RemoveGhost(i, false);
+	if(g_pUtils && g_pPlayers)
+		for(int i = 0; i < MAX_SLOTS; i++) RemoveGhost(i);
 
 	SH_REMOVE_HOOK(IGameEventSystem, PostEventAbstract, g_gameEventSystem, SH_MEMBER(this, &ghost::OnPostEvent), false);
 	if(g_pGameEventManager)
@@ -544,6 +580,14 @@ bool ghost::Unload(char *error, size_t maxlen)
 	ConVar_Unregister();
 
 	return true;
+}
+
+void ghost::HookGameEvents()
+{
+	if(g_pGameEventManager) return;
+	g_pGameEventManager = g_pUtils->GetGameEventManager();
+	if(g_pGameEventManager)
+		SH_ADD_HOOK(IGameEventManager2, FireEvent, g_pGameEventManager, SH_MEMBER(this, &ghost::OnFireEvent), false);
 }
 
 void InstallDetours()
@@ -621,9 +665,7 @@ void ghost::AllPluginsLoaded()
 	LoadConfig();
 	InstallDetours();
 
-	g_pGameEventManager = g_pUtils->GetGameEventManager();
-	if(g_pGameEventManager)
-		SH_ADD_HOOK(IGameEventManager2, FireEvent, g_pGameEventManager, SH_MEMBER(this, &ghost::OnFireEvent), false);
+	HookGameEvents();
 
 	g_pUtils->StartupServer(g_PLID, StartupServer);
 	g_pUtils->MapStartHook(g_PLID, [](const char* szMap) {
