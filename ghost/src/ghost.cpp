@@ -106,6 +106,7 @@ struct GhostState
 	float flSilentUntil = 0.0f;    // fallback "kill" in flight: its death is ours
 	int iSavedScore = 0;
 	int iSavedDeaths = 0;
+	int iTeam = 0;                 // team the ghost was made in
 };
 
 GhostState g_Ghost[MAX_SLOTS];
@@ -382,6 +383,8 @@ void RemoveGhost(int iSlot)
 	int iDeaths = pStats ? pStats->m_matchStats().m_iDeaths() : 0;
 
 	pPawn->m_lifeState = LifeState_t::LIFE_ALIVE;
+	// the ghost has m_bTakesDamage = false: without this the suicide does nothing
+	pPawn->m_bTakesDamage(true);
 	g_Ghost[iSlot].bSilentDeath = true;
 	CommitSuicide(pPawn, false, true);
 	g_Ghost[iSlot].bSilentDeath = false;
@@ -399,6 +402,7 @@ void RemoveGhost(int iSlot)
 		return;
 	}
 
+	g_Ghost[iSlot].flSilentUntil = 0.0f;
 	if (pController->m_iScore() != iScore)
 		pController->m_iScore = iScore;
 	if (pStats)
@@ -416,6 +420,7 @@ void MakeGhost(int iSlot)
 	st.bPendingRestore = false;
 	st.bSilentDeath = false;
 	st.flCooldownUntil = CurTime() + g_Config.flCooldown;
+	st.iTeam = pController->m_iTeamNum();
 	st.flDyingAt = CurTime() + GHOST_DYING_DELAY;
 	st.bExpectSpawn = true;
 	st.flExpectSpawnUntil = CurTime() + 1.0f;
@@ -567,7 +572,7 @@ void OnRoundEnd()
 void OnPlayerDeath(int iSlot)
 {
 	// the fallback "kill" from RemoveGhost: restore score and deaths
-	if (IsValidSlot(iSlot) && g_Ghost[iSlot].flSilentUntil > 0.0f)
+	if (IsValidSlot(iSlot) && g_Ghost[iSlot].flSilentUntil > CurTime())
 	{
 		GhostState& st = g_Ghost[iSlot];
 		st.flSilentUntil = 0.0f;
@@ -587,12 +592,34 @@ void OnPlayerDeath(int iSlot)
 		DeactivateGhost(iSlot);
 }
 
+// Team change: the game kills the alive pawn itself. Let that death through (the ghost does
+// not take damage otherwise), keep it out of the kill feed and give the score back.
+void PrepareSilentGameDeath(int iSlot)
+{
+	CCSPlayerController* pController = CCSPlayerController::FromSlot(iSlot);
+	CCSPlayerPawn* pPawn = pController ? pController->GetPlayerPawn() : nullptr;
+	if (!pController || !pPawn)
+		return;
+	GhostState& st = g_Ghost[iSlot];
+	st.bSilentDeath = true;
+	st.flSilentUntil = CurTime() + 2.0f;
+	st.iSavedScore = pController->m_iScore();
+	CCSPlayerController_ActionTrackingServices* pStats = pController->m_pActionTrackingServices();
+	st.iSavedDeaths = pStats ? pStats->m_matchStats().m_iDeaths() : 0;
+	pPawn->m_bTakesDamage(true);
+}
+
 void OnPlayerTeam(int iSlot)
 {
 	if (!IsGhost(iSlot))
 		return;
-	// the game does not kill a "dead" (LIFE_DYING) pawn on team change: do it ourselves
-	NextFrame([iSlot]() { RemoveGhost(iSlot); });
+	Msg("[Ghost] slot %d changes team, leaving ghost mode\n", iSlot);
+	PrepareSilentGameDeath(iSlot);
+	// if the game did not kill him (e.g. same team), do it ourselves
+	NextFrame([iSlot]() {
+		if (IsGhost(iSlot))
+			RemoveGhost(iSlot);
+	});
 }
 
 // Respawn by the game or another plugin (admin respawn, warmup...) turns a ghost back into a normal player.
@@ -822,6 +849,13 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 		{
 			if (st.bExpectSpawn && flNow > st.flExpectSpawnUntil)
 				st.bExpectSpawn = false;
+			CCSPlayerController* pTeamCtl = CCSPlayerController::FromSlot(i);
+			if (pTeamCtl && st.iTeam != 0 && pTeamCtl->m_iTeamNum() != st.iTeam)
+			{
+				Msg("[Ghost] slot %d is in another team now, leaving ghost mode\n", i);
+				RemoveGhost(i);
+				continue;
+			}
 			CCSPlayerPawn* pPawn = GetPawn(i);
 			if (!pPawn)
 				continue;
