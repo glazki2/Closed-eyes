@@ -274,10 +274,16 @@ public:
 	SCHEMA_FIELD(bool, m_bHasDefuser);
 	SCHEMA_FIELD(bool, m_bHasHelmet);
 
-	void RemoveWeapons()
-    {
-		CALL_VIRTUAL(void, 23, this);
-    }
+	// CCSPlayer_ItemServices::StripPlayerWeapons(bool removeSuit), see CS2Fixes services.h:
+	// 2 dtor slots + 22 CPlayerPawnComponent slots + _GiveNamedItem, GiveNamedItemBool, GiveNamedItem, DropActiveWeapon
+	void RemoveWeapons(bool bRemoveSuit = true)
+	{
+#ifdef _WIN32
+		CALL_VIRTUAL(void, 27, this, bRemoveSuit);
+#else
+		CALL_VIRTUAL(void, 28, this, bRemoveSuit);
+#endif
+	}
 };
 
 // We need an exactly sized class to be able to iterate the vector, our schema system implementation can't do this

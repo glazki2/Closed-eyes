@@ -45,13 +45,16 @@ bool g_bRoundActive = false;
 std::string g_szModel;
 float g_flCooldown = 5.0f;
 bool g_bEnabled = true;
-std::string g_szSigCanAcquire = "55 48 89 E5 41 57 41 56 41 55 49 89 CD 41 54 49 89 FC 53 48 89 F3 48 83 EC 78";
-std::string g_szSigProcessUsercmds;
+// Signatures from CS2Fixes gamedata (linux server.so)
+std::string g_szSigCanAcquire = "55 48 89 E5 41 57 41 56 49 89 F6 41 55 41 54 49 89 CC 53 48 89 FB 48 83 EC ? 4C 8B 6F";
+std::string g_szSigProcessUsercmds = "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 89 FB 48 83 EC ? 89 4D";
+std::string g_szSigFindUseEntity = "48 B9 ? ? ? ? ? ? ? ? 55 48 89 E5 41 57 49 89 FF";
 int g_iUserCmdPbOffset = 0x10;
 int g_iUserCmdSize = 0;
 
 funchook_t* m_CanAcquire = nullptr;
 funchook_t* m_ProcessUsercmds = nullptr;
+funchook_t* m_FindUseEntity = nullptr;
 CTimer* g_pReapplyTimer = nullptr;
 
 inline bool IsValidSlot(int iSlot) { return iSlot >= 0 && iSlot < MAX_SLOTS; }
@@ -152,6 +155,17 @@ void* ProcessUsercmds(CCSPlayerController* pController, CUserCmd* cmds, int numc
 	return UTIL_ProcessUsercmds(pController, cmds, numcmds, paused, margin);
 }
 
+// +use target search: a ghost never finds anything to use (doors, buttons, weapons, hostages)
+class CCSPlayer_UseServices;
+CBaseEntity* (*UTIL_FindUseEntity)(CCSPlayer_UseServices* pThis, float flUnk, int64_t nUnk) = nullptr;
+
+CBaseEntity* FindUseEntity(CCSPlayer_UseServices* pThis, float flUnk, int64_t nUnk)
+{
+	CCSPlayerPawn* pPawn = pThis ? ((CPlayerPawnComponent*)pThis)->GetPawn() : nullptr;
+	if(pPawn && IsGhost(GetSlotFromPawnEntity(pPawn))) return nullptr;
+	return UTIL_FindUseEntity(pThis, flUnk, nUnk);
+}
+
 ///////////////////////////////////////
 // Hooks
 
@@ -246,7 +260,7 @@ void ApplyGhost(int iSlot)
 		if(attr.m_nInteractsAs() != 0)
 		{
 			attr.m_nInteractsAs = 0;
-			pPawn->CollisionRulesChanged();
+			g_pUtils->CollisionRulesChanged(pPawn);
 		}
 	}
 
@@ -273,7 +287,7 @@ void RestorePawn(int iSlot)
 	if(g_Ghost[iSlot].bSavedCollision && pPawn->m_pCollision())
 	{
 		pPawn->m_pCollision()->m_collisionAttribute().m_nInteractsAs = g_Ghost[iSlot].nSavedInteractsAs;
-		pPawn->CollisionRulesChanged();
+		g_pUtils->CollisionRulesChanged(pPawn);
 	}
 	pPawn->m_flShadowStrength() = 1.0f;
 	pPawn->m_fEffects = pPawn->m_fEffects() & ~(uint32)(EF_NODRAW | EF_NOSHADOW);
@@ -457,7 +471,8 @@ void LoadConfig()
 	g_szModel = hKv->GetString("model", "");
 	g_flCooldown = hKv->GetFloat("cooldown", 5.0f);
 	g_szSigCanAcquire = hKv->GetString("sig_canacquire", g_szSigCanAcquire.c_str());
-	g_szSigProcessUsercmds = hKv->GetString("sig_processusercmds", "");
+	g_szSigProcessUsercmds = hKv->GetString("sig_processusercmds", g_szSigProcessUsercmds.c_str());
+	g_szSigFindUseEntity = hKv->GetString("sig_findusentity", g_szSigFindUseEntity.c_str());
 	g_iUserCmdPbOffset = hKv->GetInt("usercmd_pb_offset", 0x10);
 	g_iUserCmdSize = hKv->GetInt("usercmd_size", 0);
 	delete hKv;
@@ -511,6 +526,11 @@ bool ghost::Unload(char *error, size_t maxlen)
 		funchook_uninstall(m_CanAcquire, 0);
 		funchook_destroy(m_CanAcquire);
 	}
+	if(m_FindUseEntity)
+	{
+		funchook_uninstall(m_FindUseEntity, 0);
+		funchook_destroy(m_FindUseEntity);
+	}
 	if(m_ProcessUsercmds)
 	{
 		funchook_uninstall(m_ProcessUsercmds, 0);
@@ -538,6 +558,16 @@ void InstallDetours()
 		m_CanAcquire = funchook_create();
 		funchook_prepare(m_CanAcquire, (void**)&UTIL_CanAcquire, (void*)CanAcquire);
 		funchook_install(m_CanAcquire, 0);
+	}
+
+	UTIL_FindUseEntity = g_szSigFindUseEntity.empty() ? nullptr : libserver.FindPattern(g_szSigFindUseEntity.c_str()).RCast< decltype(UTIL_FindUseEntity) >();
+	if(!UTIL_FindUseEntity)
+		g_pUtils->ErrorLog("[Ghost] FindUseEntity signature not found: +use is blocked only by ProcessUsercmds");
+	else
+	{
+		m_FindUseEntity = funchook_create();
+		funchook_prepare(m_FindUseEntity, (void**)&UTIL_FindUseEntity, (void*)FindUseEntity);
+		funchook_install(m_FindUseEntity, 0);
 	}
 
 	if(g_szSigProcessUsercmds.empty())
