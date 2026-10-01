@@ -54,6 +54,13 @@
 3. Перезапустите сервер или выполните `meta load addons/ghost/ghost`.
 4. Проверьте `meta list` и консоль: если какая-то сигнатура не найдена, плагин напишет об этом в лог и выключит только эту функцию.
 
+## Если в `meta list` плагин показан как `<ERROR>`
+
+1. Посмотрите строку загрузки в начале лога сервера (`[META] Failed to load plugin ...`): там причина.
+2. `version 'GLIBC_2.3x' not found`: плагин собран не под Steam Runtime. Берите сборку из `release/` (она требует не больше GLIBC 2.14) или собирайте через `./build.sh`.
+3. `CAppSystemDict:Unable to create interface Source2ServerConfig001` при старте сервера: это сам Metamod не подходит к новой версии CS2 после обновления игры. Обновите Metamod:Source до последней сборки 2.0 dev. Плагины тут ни при чём, но для проверки можно временно убрать `addons/metamod/ghost.vdf`.
+4. Не пишите в консоли две команды подряд (`meta unload 2 meta load ...`): сначала `meta unload 2`, потом отдельно `meta load addons/ghost/ghost`.
+
 ## Конфиг `addons/configs/ghost.ini`
 
 | Ключ | По умолчанию | Назначение |
@@ -74,7 +81,9 @@
 ./build.sh            # скачает hl2sdk-cs2, Metamod, AMBuild и соберёт build/ghost-linux-x86_64.zip
 ```
 
-Нужны git, python3, pip, clang и zip. Версии зависимостей закреплены в `build.sh`: hl2sdk `cs2` @ `22087f5`, Metamod @ `7ec0f16` (последний коммит с SourceHook).
+Нужны git, python3, pip, clang, curl, dpkg-deb, zip и binutils. Версии зависимостей закреплены в `build.sh`: hl2sdk `cs2` @ `22087f5`, Metamod @ `7ec0f16` (последний коммит с SourceHook).
+
+CS2 работает в Steam Runtime «sniper» с **glibc 2.31**. Поэтому `build.sh` собирает clang'ом с sysroot из пакетов Ubuntu 20.04 (glibc 2.31, libstdc++ из GCC 10, линкуется статически) и в конце проверяет, что `ghost.so` не требует glibc новее 2.31. Сборка на свежем дистрибутиве без sysroot даст `<ERROR>` в `meta list`.
 
 ## Структура репозитория
 
@@ -90,7 +99,8 @@ GHOST_PLAN.md     план и обоснование решений
 
 - ✅ **Собирается** без ошибок (clang 18, `-Wall -Werror`) с текущим hl2sdk-cs2.
 - ✅ Все внешние символы `ghost.so` закрываются `libtier0.so` движка.
-- ✅ `ghost.so` загружается через `dlopen(RTLD_NOW)`, и `CreateInterface("ISmmPlugin")` отдаёт объект плагина, то есть Metamod его увидит.
+- ✅ `ghost.so` загружается через `dlopen(RTLD_NOW)` **под glibc 2.31** (как в Steam Runtime sniper), и `CreateInterface("ISmmPlugin")` отдаёт объект плагина, то есть Metamod его увидит.
+- ✅ Требует не больше GLIBC 2.14, от системного libstdc++ не зависит.
 - ⚠️ **Сигнатуры не сверены с настоящим `libserver.so`**: в среде сборки Steam был недоступен. Они взяты из актуального CS2Fixes. Если какая-то не найдена, это будет в логе сервера.
 - ⚠️ **На живом сервере ещё не тестировался.** Перед боевым сервером проверьте на тестовом:
   1. нож (ЛКМ и ПКМ, спереди и сзади) по призраку — не попадает;
