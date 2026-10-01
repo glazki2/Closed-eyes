@@ -103,6 +103,9 @@ struct GhostState
 	float flCooldownUntil = 0.0f;
 	float flDyingAt = 0.0f;        // when LIFE_DYING may be set
 	float flExpectSpawnUntil = 0.0f;
+	float flSilentUntil = 0.0f;    // fallback "kill" in flight: its death is ours
+	int iSavedScore = 0;
+	int iSavedDeaths = 0;
 };
 
 GhostState g_Ghost[MAX_SLOTS];
@@ -385,10 +388,14 @@ void RemoveGhost(int iSlot)
 
 	if (pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE)
 	{
-		// suicide did not happen: never leave a "revived" player behind, stay a ghost
-		Warning("[Ghost] CommitSuicide failed for slot %d, player stays a ghost\n", iSlot);
-		g_Ghost[iSlot].bActive = true;
-		g_Ghost[iSlot].bPendingRestore = false;
+		// direct suicide did not happen: fall back to the game's own "kill" command.
+		// The death stays silent; Hook_GameFrame turns him back into a ghost if it never comes.
+		Msg("[Ghost] CommitSuicide had no effect for slot %d, using kill\n", iSlot);
+		g_Ghost[iSlot].bSilentDeath = true;
+		g_Ghost[iSlot].flSilentUntil = CurTime() + 2.0f;
+		g_Ghost[iSlot].iSavedScore = iScore;
+		g_Ghost[iSlot].iSavedDeaths = iDeaths;
+		engine->ClientCommand(CPlayerSlot(iSlot), "kill");
 		return;
 	}
 
@@ -559,6 +566,22 @@ void OnRoundEnd()
 
 void OnPlayerDeath(int iSlot)
 {
+	// the fallback "kill" from RemoveGhost: restore score and deaths
+	if (IsValidSlot(iSlot) && g_Ghost[iSlot].flSilentUntil > 0.0f)
+	{
+		GhostState& st = g_Ghost[iSlot];
+		st.flSilentUntil = 0.0f;
+		st.bSilentDeath = false;
+		int iScore = st.iSavedScore, iDeaths = st.iSavedDeaths;
+		NextFrame([iSlot, iScore, iDeaths]() {
+			CCSPlayerController* pController = CCSPlayerController::FromSlot(iSlot);
+			if (!pController)
+				return;
+			pController->m_iScore = iScore;
+			if (CCSPlayerController_ActionTrackingServices* pStats = pController->m_pActionTrackingServices())
+				pStats->m_matchStats().m_iDeaths() = iDeaths;
+		});
+	}
 	// a ghost killed by something else: keep the body hidden, restore on the next spawn
 	if (IsGhost(iSlot))
 		DeactivateGhost(iSlot);
@@ -811,7 +834,20 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 			if (!pPawn)
 				continue;
 			// ghost body after round end / unghost is DYING or DEAD; ALIVE means the game respawned the player
-			if (pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE)
+			if (st.flSilentUntil > 0.0f && pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE)
+			{
+				// waiting for the fallback "kill"; if it never came, he is still a ghost
+				if (flNow > st.flSilentUntil)
+				{
+					Warning("[Ghost] could not kill slot %d, player stays a ghost\n", i);
+					st.flSilentUntil = 0.0f;
+					st.bSilentDeath = false;
+					st.bPendingRestore = false;
+					st.bActive = true;
+					PrintToChat(i, CHAT_PREFIX "Не получилось выйти из режима призрака");
+				}
+			}
+			else if (pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE)
 				RestorePawn(i);
 			else if (bReapply && pPawn->m_lifeState() == LifeState_t::LIFE_DYING)
 				StripWeapons(pPawn);
@@ -1116,7 +1152,7 @@ bool GhostPlugin::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, b
 	if (late)
 		RefreshGlobals();
 
-	Msg("[Ghost] loaded\n");
+	Msg("[Ghost] loaded, version %s\n", PLUGIN_FULL_VERSION);
 	return true;
 }
 
