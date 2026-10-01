@@ -429,6 +429,7 @@ void MakeGhost(int iSlot)
 
 void OnGhostCommand(int iSlot)
 {
+	Msg("[Ghost] !ghost from slot %d\n", iSlot);
 	if (!IsValidSlot(iSlot))
 		return;
 	CCSPlayerController* pController = CCSPlayerController::FromSlot(iSlot);
@@ -454,8 +455,9 @@ void OnGhostCommand(int iSlot)
 		return;
 	}
 	CCSGameRules* pRules = GetGameRules();
-	if (!g_bRoundActive || (pRules && pRules->m_bWarmupPeriod()))
+	if (pRules && pRules->m_bWarmupPeriod())
 	{
+		Msg("[Ghost] slot %d: refused, warmup\n", iSlot);
 		PrintToChat(iSlot, CHAT_PREFIX "Сейчас нельзя: разминка или раунд не идёт");
 		return;
 	}
@@ -599,6 +601,13 @@ KHook::Return<bool> Hook_FireEvent(IGameEventManager2* pThis, IGameEvent* pEvent
 	if (!szName)
 		return {KHook::Action::Ignore, false};
 
+	static bool s_bLogged = false;
+	if (!s_bLogged)
+	{
+		s_bLogged = true;
+		Msg("[Ghost] FireEvent hook works (first event: %s)\n", szName);
+	}
+
 	if (!strcmp(szName, "player_death"))
 	{
 		int iSlot = pEvent->GetPlayerSlot("userid").Get();
@@ -697,6 +706,22 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 	RefreshGlobals();
 	if (!gpGlobals || !g_pEntitySystem)
 		return {KHook::Action::Ignore};
+
+	// round start fallback: works even if the FireEvent hook never fires
+	static float s_flLastRoundStart = -1.0f;
+	if (CCSGameRules* pRules = GetGameRules())
+	{
+		float t = pRules->m_fRoundStartTime().GetTime();
+		if (t != s_flLastRoundStart)
+		{
+			bool bFirst = s_flLastRoundStart < 0.0f;
+			s_flLastRoundStart = t;
+			if (!bFirst && !g_bRoundActive)
+				OnRoundStart();
+			else if (bFirst)
+				g_bRoundActive = true;
+		}
+	}
 
 	if (!g_NextFrame.empty())
 	{
