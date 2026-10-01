@@ -20,6 +20,13 @@ ISkinChangerApi* g_pSCApi;
 
 #define MAX_SLOTS 64
 
+#ifndef EF_NOSHADOW
+#define EF_NOSHADOW 0x010
+#endif
+#ifndef EF_NODRAW
+#define EF_NODRAW 0x020
+#endif
+
 #define GHOST_BLOCKED_BUTTONS (IN_ATTACK | IN_USE | IN_ATTACK2 | IN_RELOAD)
 
 struct GhostState
@@ -27,7 +34,7 @@ struct GhostState
 	bool bActive;
 	bool bSilentDeath;   // following player_death must not be broadcast
 	float flCooldownUntil;
-	uint32 nSavedInteractsAs;
+	uint64_t nSavedInteractsAs;
 	bool bSavedCollision;
 };
 
@@ -227,26 +234,30 @@ void ApplyGhost(int iSlot)
 
 	// Intangible: knife/bullet/grenade traces and triggers ignore the pawn,
 	// movement still collides with the world (m_nInteractsWith untouched).
-	auto& attr = pPawn->m_pCollision()->m_collisionAttribute();
-	if(!g_Ghost[iSlot].bSavedCollision)
+	CCollisionProperty* pCollision = pPawn->m_pCollision();
+	if(pCollision)
 	{
-		g_Ghost[iSlot].nSavedInteractsAs = attr.m_nInteractsAs;
-		g_Ghost[iSlot].bSavedCollision = true;
-	}
-	if(attr.m_nInteractsAs != 0)
-	{
-		attr.m_nInteractsAs = 0;
-		pPawn->CollisionRulesChanged();
+		VPhysicsCollisionAttribute_t& attr = pCollision->m_collisionAttribute();
+		if(!g_Ghost[iSlot].bSavedCollision)
+		{
+			g_Ghost[iSlot].nSavedInteractsAs = attr.m_nInteractsAs();
+			g_Ghost[iSlot].bSavedCollision = true;
+		}
+		if(attr.m_nInteractsAs() != 0)
+		{
+			attr.m_nInteractsAs = 0;
+			pPawn->CollisionRulesChanged();
+		}
 	}
 
 	// Invisible, no shadow
 	pPawn->m_flShadowStrength() = 0.0f;
-	pPawn->m_fEffects() |= (EF_NODRAW | EF_NOSHADOW);
-	g_pUtils->SetStateChanged(pPawn, "CBaseEntity", "m_fEffects");
-	pPawn->m_nRenderMode() = kRenderNone;
-	g_pUtils->SetStateChanged(pPawn, "CBaseModelEntity", "m_nRenderMode");
-	pPawn->m_clrRender() = Color(255, 255, 255, 0);
-	g_pUtils->SetStateChanged(pPawn, "CBaseModelEntity", "m_clrRender");
+	if((pPawn->m_fEffects() & (EF_NODRAW | EF_NOSHADOW)) != (EF_NODRAW | EF_NOSHADOW))
+		pPawn->m_fEffects = pPawn->m_fEffects() | EF_NODRAW | EF_NOSHADOW;
+	if(pPawn->m_nRenderMode() != kRenderNone)
+		pPawn->m_nRenderMode = kRenderNone;
+	if(pPawn->m_clrRender().a() != 0)
+		pPawn->m_clrRender = Color(255, 255, 255, 0);
 
 	// Dead for the game: round end counting, scoreboard, radar, chat/voice
 	pPawn->m_lifeState() = LifeState_t::LIFE_DYING;
@@ -259,18 +270,15 @@ void RestorePawn(int iSlot)
 	CCSPlayerPawn* pPawn = pController->GetPlayerPawn();
 	if(!pPawn) return;
 
-	if(g_Ghost[iSlot].bSavedCollision)
+	if(g_Ghost[iSlot].bSavedCollision && pPawn->m_pCollision())
 	{
 		pPawn->m_pCollision()->m_collisionAttribute().m_nInteractsAs = g_Ghost[iSlot].nSavedInteractsAs;
 		pPawn->CollisionRulesChanged();
 	}
 	pPawn->m_flShadowStrength() = 1.0f;
-	pPawn->m_fEffects() &= ~(EF_NODRAW | EF_NOSHADOW);
-	g_pUtils->SetStateChanged(pPawn, "CBaseEntity", "m_fEffects");
-	pPawn->m_nRenderMode() = kRenderNormal;
-	g_pUtils->SetStateChanged(pPawn, "CBaseModelEntity", "m_nRenderMode");
-	pPawn->m_clrRender() = Color(255, 255, 255, 255);
-	g_pUtils->SetStateChanged(pPawn, "CBaseModelEntity", "m_clrRender");
+	pPawn->m_fEffects = pPawn->m_fEffects() & ~(uint32)(EF_NODRAW | EF_NOSHADOW);
+	pPawn->m_nRenderMode = kRenderNormal;
+	pPawn->m_clrRender = Color(255, 255, 255, 255);
 	pPawn->m_bTakesDamage(true);
 }
 
