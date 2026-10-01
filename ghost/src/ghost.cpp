@@ -292,9 +292,8 @@ void ApplyGhost(int iSlot)
 	if (pPawn->m_clrRender().a() != 0)
 		pPawn->m_clrRender = Color(255, 255, 255, 0);
 
-	// Dead for the game: round end counting, scoreboard, radar, chat/voice, bots
-	if (CurTime() >= g_Ghost[iSlot].flDyingAt && pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE)
-		pPawn->m_lifeState = LifeState_t::LIFE_DYING;
+	// The pawn stays LIFE_ALIVE: any other life state gives the ghost a black screen.
+	// Round end by elimination is handled in CheckTeamsEliminated().
 }
 
 // Player interaction layers must never stay 0 on a normal player: that would make him unhittable.
@@ -390,7 +389,6 @@ void RemoveGhost(int iSlot)
 		Warning("[Ghost] CommitSuicide failed for slot %d, player stays a ghost\n", iSlot);
 		g_Ghost[iSlot].bActive = true;
 		g_Ghost[iSlot].bPendingRestore = false;
-		pPawn->m_lifeState = LifeState_t::LIFE_DYING;
 		return;
 	}
 
@@ -553,8 +551,10 @@ void OnRoundStart()
 void OnRoundEnd()
 {
 	g_bRoundActive = false;
+	// ghosts are alive for the game: they leave silently, otherwise they would "survive" the round
 	for (int i = 0; i < MAX_SLOTS; i++)
-		DeactivateGhost(i);
+		if (IsGhost(i))
+			NextFrame([i]() { RemoveGhost(i); });
 }
 
 void OnPlayerDeath(int iSlot)
@@ -699,6 +699,56 @@ KHook::Return<void> Hook_StartupServer(INetworkServerService* pThis, const GameS
 }
 KHook::Virtual<INetworkServerService, void, const GameSessionConfiguration_t&, ISource2WorldSession*, const char*> g_hkStartupServer(nullptr, Hook_StartupServer);
 
+// Ghosts are alive for the game. When a team has no real (non-ghost) players alive,
+// its ghosts leave silently so the game ends the round by elimination as usual.
+void CheckTeamsEliminated()
+{
+	if (!g_bRoundActive)
+		return;
+	int nReal[4] = {}, nGhosts[4] = {};
+	for (int i = 0; i < MAX_SLOTS; i++)
+	{
+		CCSPlayerController* pController = CCSPlayerController::FromSlot(i);
+		if (!pController)
+			continue;
+		int iTeam = pController->m_iTeamNum();
+		if (iTeam != 2 && iTeam != 3)
+			continue;
+		if (IsGhost(i))
+		{
+			nGhosts[iTeam]++;
+			continue;
+		}
+		CCSPlayerPawn* pPawn = pController->GetPlayerPawn();
+		if (pPawn && pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE && !g_Ghost[i].bPendingRestore)
+			nReal[iTeam]++;
+	}
+	for (int iTeam = 2; iTeam <= 3; iTeam++)
+	{
+		if (nGhosts[iTeam] == 0 || nReal[iTeam] > 0)
+			continue;
+		for (int i = 0; i < MAX_SLOTS; i++)
+		{
+			CCSPlayerController* pController = IsGhost(i) ? CCSPlayerController::FromSlot(i) : nullptr;
+			if (pController && pController->m_iTeamNum() == iTeam)
+			{
+				RemoveGhost(i);
+				PrintToChat(i, CHAT_PREFIX "В твоей команде никого не осталось, режим призрака выключен");
+			}
+		}
+	}
+}
+
+// round_end without the event hook: the game sets the next round restart time when the round ends
+void CheckRoundEndFallback()
+{
+	if (!g_bRoundActive)
+		return;
+	CCSGameRules* pRules = GetGameRules();
+	if (pRules && pRules->m_flRestartRoundTime().GetTime() > CurTime())
+		OnRoundEnd();
+}
+
 // --- per tick: next-frame queue, re-apply ghost state, LIFE_DYING after the delay, restore respawned players
 KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool bFirstTick, bool bLastTick)
 {
@@ -734,6 +784,9 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 	if (!g_bAnyGhostState)
 		return {KHook::Action::Ignore};
 
+	CheckRoundEndFallback();
+	CheckTeamsEliminated();
+
 	float flNow = CurTime();
 	bool bReapply = flNow >= g_flNextReapply;
 	if (bReapply)
@@ -749,8 +802,7 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 			CCSPlayerPawn* pPawn = GetPawn(i);
 			if (!pPawn)
 				continue;
-			bool bNeedDying = flNow >= st.flDyingAt && pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE;
-			if (bReapply || bNeedDying)
+			if (bReapply || flNow < st.flDyingAt + 0.5f)
 				ApplyGhost(i);
 		}
 		else if (st.bPendingRestore)
