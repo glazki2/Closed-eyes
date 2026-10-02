@@ -115,6 +115,7 @@ GhostState g_Ghost[MAX_SLOTS];
 bool g_bRoundActive = true; // late load mid-round: allow until the next map start
 bool g_bAnyGhostState = false;
 bool g_bEnabled = true;
+bool g_bDebug = false;
 float g_flNextReapply = 0.0f;
 std::vector<std::function<void()>> g_NextFrame;
 
@@ -553,6 +554,14 @@ CON_COMMAND_F(mm_ghost_toggle, "Enable/disable ghost mode (server console)", FCV
 }
 
 extern int g_nBlockedSounds;
+CON_COMMAND_F(mm_ghost_debug, "Log every sound/event while a ghost exists (server console)", FCVAR_NONE)
+{
+	if (context.GetPlayerSlot().Get() != -1)
+		return;
+	g_bDebug = !g_bDebug;
+	Msg("[Ghost] debug %s\n", g_bDebug ? "on" : "off");
+}
+
 CON_COMMAND_F(mm_ghost_status, "Show ghost plugin status (server console)", FCVAR_NONE)
 {
 	if (context.GetPlayerSlot().Get() != -1)
@@ -689,6 +698,18 @@ KHook::Return<bool> Hook_FireEvent(IGameEventManager2* pThis, IGameEvent* pEvent
 		// the ghost's deaths never reach clients (no kill feed); other plugins still see the event
 		if (bHide && !bDontBroadcast)
 			return KHook::Recall<bool (IGameEventManager2::*)(IGameEvent*, bool)>(nullptr, {KHook::Action::Ignore, false}, pThis, pEvent, true);
+	}
+	else if (!strcmp(szName, "player_footstep") || !strcmp(szName, "player_jump") || !strcmp(szName, "player_sound")
+			 || !strcmp(szName, "weapon_zoom") || !strcmp(szName, "player_falldamage"))
+	{
+		// movement noise of a ghost (radar footstep marks, client sound cues) never reaches clients
+		int iSlot = pEvent->GetPlayerSlot("userid").Get();
+		if (IsGhostPawn(iSlot) && !bDontBroadcast)
+		{
+			if (g_bDebug)
+				Msg("[Ghost] debug: hid event %s of slot %d\n", szName, iSlot);
+			return KHook::Recall<bool (IGameEventManager2::*)(IGameEvent*, bool)>(nullptr, {KHook::Action::Ignore, false}, pThis, pEvent, true);
+		}
 	}
 	else if (!strcmp(szName, "player_spawn"))
 		OnPlayerSpawn(pEvent->GetPlayerSlot("userid").Get());
@@ -1013,7 +1034,11 @@ bool IsGhostSound(INetworkMessageInternal* pEvent, const CNetMessage* pData)
 	if (!szName || strcmp(szName, "CMsgSosStartSoundEvent"))
 		return false;
 	auto msg = const_cast<CNetMessage*>(pData)->ToPB<CMsgSosStartSoundEvent>();
-	int iSlot = GetSlotFromPawnEntity(UTIL_GetEntityByIndex(msg->source_entity_index()));
+	CEntityInstance* pSource = msg->has_source_entity_index() ? UTIL_GetEntityByIndex(msg->source_entity_index()) : nullptr;
+	int iSlot = GetSlotFromPawnEntity(pSource);
+	if (g_bDebug)
+		Msg("[Ghost] debug: sound hash %u source %d (%s) slot %d ghost %d\n", msg->soundevent_hash(),
+			msg->has_source_entity_index() ? (int)msg->source_entity_index() : -1, pSource ? pSource->GetClassname() : "none", iSlot, IsGhostPawn(iSlot));
 	if (!IsGhostPawn(iSlot))
 		return false;
 	if (g_nBlockedSounds++ == 0)
