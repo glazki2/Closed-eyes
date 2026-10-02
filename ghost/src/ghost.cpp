@@ -565,6 +565,7 @@ CON_COMMAND_F(mm_ghost_toggle, "Enable/disable ghost mode (server console)", FCV
 	Msg("[Ghost] %s\n", g_bEnabled ? "enabled" : "disabled");
 }
 
+extern int g_nBlockedSounds;
 CON_COMMAND_F(mm_ghost_status, "Show ghost plugin status (server console)", FCVAR_NONE)
 {
 	if (context.GetPlayerSlot().Get() != -1)
@@ -573,7 +574,7 @@ CON_COMMAND_F(mm_ghost_status, "Show ghost plugin status (server console)", FCVA
 	for (int i = 0; i < MAX_SLOTS; i++)
 		if (IsGhost(i))
 			nGhosts++;
-	Msg("[Ghost] %s, ghosts: %d, round active: %d\n", g_bEnabled ? "enabled" : "disabled", nGhosts, g_bRoundActive);
+	Msg("[Ghost] %s, ghosts: %d, round active: %d, blocked ghost sounds: %d\n", g_bEnabled ? "enabled" : "disabled", nGhosts, g_bRoundActive, g_nBlockedSounds);
 }
 
 ///////////////////////////////////////
@@ -1010,29 +1011,65 @@ KHook::Return<void> Hook_CheckTransmit(ISource2GameEntities* pThis, CCheckTransm
 KHook::Virtual<ISource2GameEntities, void, CCheckTransmitInfo**, int, CBitVec<16384>&, CBitVec<16384>&, const Entity2Networkable_t**, const uint16*, int>
 	g_hkCheckTransmit(nullptr, Hook_CheckTransmit);
 
-// --- footsteps / jump / land sounds of a ghost are sent only to the ghost himself
-KHook::Return<void> Hook_PostEventAbstract(IGameEventSystem* pThis, CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCount, const uint64* clients,
-										   INetworkMessageInternal* pEvent, const CNetMessage* pData, unsigned long nSize, NetChannelBufType_t bufType)
+// --- footsteps / jump / land sounds of a ghost: nobody hears them, the ghost included.
+// The engine has several send paths, all of them are covered.
+int g_nBlockedSounds = 0;
+
+bool IsGhostSound(INetworkMessageInternal* pEvent, const CNetMessage* pData)
 {
-	if (!g_bAnyGhostState || !clients || !pEvent || !pData)
-		return {KHook::Action::Ignore};
+	if (!g_bAnyGhostState || !pEvent || !pData)
+		return false;
 	NetMessageInfo_t* info = pEvent->GetNetMessageInfo();
 	if (!info || !info->m_pBinding)
-		return {KHook::Action::Ignore};
+		return false;
 	const char* szName = info->m_pBinding->GetName();
 	if (!szName || strcmp(szName, "CMsgSosStartSoundEvent"))
-		return {KHook::Action::Ignore};
-
+		return false;
 	auto msg = const_cast<CNetMessage*>(pData)->ToPB<CMsgSosStartSoundEvent>();
 	int iSlot = GetSlotFromPawnEntity(UTIL_GetEntityByIndex(msg->source_entity_index()));
 	if (!IsGhostPawn(iSlot))
-		return {KHook::Action::Ignore};
+		return false;
+	if (g_nBlockedSounds++ == 0)
+		Msg("[Ghost] blocking ghost sounds works (slot %d)\n", iSlot);
+	return true;
+}
 
-	// nobody hears a ghost body, the ghost included (steps, jumps, landing)
-	return {KHook::Action::Supersede};
+KHook::Return<void> Hook_PostEventAbstract(IGameEventSystem* pThis, CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCount, const uint64* clients,
+										   INetworkMessageInternal* pEvent, const CNetMessage* pData, unsigned long nSize, NetChannelBufType_t bufType)
+{
+	if (IsGhostSound(pEvent, pData))
+		return {KHook::Action::Supersede};
+	return {KHook::Action::Ignore};
 }
 KHook::Virtual<IGameEventSystem, void, CSplitScreenSlot, bool, int, const uint64*, INetworkMessageInternal*, const CNetMessage*, unsigned long, NetChannelBufType_t>
 	g_hkPostEventAbstract(Hook_PostEventAbstract, nullptr);
+
+KHook::Return<void> Hook_PostEventAbstractFilter(IGameEventSystem* pThis, CSplitScreenSlot nSlot, bool bLocalOnly, IRecipientFilter* pFilter,
+												 INetworkMessageInternal* pEvent, const CNetMessage* pData, unsigned long nSize)
+{
+	if (IsGhostSound(pEvent, pData))
+		return {KHook::Action::Supersede};
+	return {KHook::Action::Ignore};
+}
+KHook::Virtual<IGameEventSystem, void, CSplitScreenSlot, bool, IRecipientFilter*, INetworkMessageInternal*, const CNetMessage*, unsigned long>
+	g_hkPostEventAbstractFilter(Hook_PostEventAbstractFilter, nullptr);
+
+// entity-bound events (sounds attached to the pawn)
+KHook::Return<void> Hook_PostEntityEventAbstract(IGameEventSystem* pThis, const CBaseHandle& hndl, INetworkMessageInternal* pEvent, const CNetMessage* pData,
+												 unsigned long nSize, NetChannelBufType_t bufType)
+{
+	if (g_bAnyGhostState && hndl.IsValid() && IsGhostPawn(GetSlotFromPawnEntity(UTIL_GetEntityByIndex(hndl.GetEntryIndex()))))
+	{
+		if (g_nBlockedSounds++ == 0)
+			Msg("[Ghost] blocking ghost entity events works\n");
+		return {KHook::Action::Supersede};
+	}
+	if (IsGhostSound(pEvent, pData))
+		return {KHook::Action::Supersede};
+	return {KHook::Action::Ignore};
+}
+KHook::Virtual<IGameEventSystem, void, const CBaseHandle&, INetworkMessageInternal*, const CNetMessage*, unsigned long, NetChannelBufType_t>
+	g_hkPostEntityEventAbstract(Hook_PostEntityEventAbstract, nullptr);
 
 ///////////////////////////////////////
 // Detours (signatures from the config)
@@ -1213,6 +1250,10 @@ bool GhostPlugin::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, b
 	g_hkCheckTransmit.Add(g_pSource2GameEntities);
 	g_hkPostEventAbstract.Configure(static_cast<void (IGameEventSystem::*)(CSplitScreenSlot, bool, int, const uint64*, INetworkMessageInternal*, const CNetMessage*, unsigned long, NetChannelBufType_t)>(&IGameEventSystem::PostEventAbstract));
 	g_hkPostEventAbstract.Add(g_gameEventSystem);
+	g_hkPostEventAbstractFilter.Configure(static_cast<void (IGameEventSystem::*)(CSplitScreenSlot, bool, IRecipientFilter*, INetworkMessageInternal*, const CNetMessage*, unsigned long)>(&IGameEventSystem::PostEventAbstract));
+	g_hkPostEventAbstractFilter.Add(g_gameEventSystem);
+	g_hkPostEntityEventAbstract.Configure(&IGameEventSystem::PostEntityEventAbstract);
+	g_hkPostEntityEventAbstract.Add(g_gameEventSystem);
 
 	UTIL_SetPawn = (decltype(UTIL_SetPawn))FindSignature(libserver, g_Config.szSigSetPawn, "CBasePlayerController::SetPawn", "respawn from spectator may fail");
 	SetupDetour(g_hkTakeDamage, libserver, g_Config.szSigTakeDamage, "CBaseEntity::TakeDamageOld", "damage to/from ghosts is not blocked");
@@ -1252,6 +1293,8 @@ bool GhostPlugin::Unload(char* error, size_t maxlen)
 	g_hkDispatchConCommand.Remove(g_pCVar);
 	g_hkCheckTransmit.Remove(g_pSource2GameEntities);
 	g_hkPostEventAbstract.Remove(g_gameEventSystem);
+	g_hkPostEventAbstractFilter.Remove(g_gameEventSystem);
+	g_hkPostEntityEventAbstract.Remove(g_gameEventSystem);
 
 	ConVar_Unregister();
 	return true;

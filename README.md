@@ -57,7 +57,7 @@
    addons/metamod/ghost.vdf
    ```
 4. Перезапустите сервер или выполните `meta load addons/ghost/bin/linuxsteamrt64/ghost`.
-5. `meta list` должен показать `Ghost (3.5.0) by glazki2`. В консоли при загрузке будет `[Ghost] loaded`. Если какая-то сигнатура не найдена, будет строка `[Ghost] ... signature not found` — отключится только эта функция.
+5. `meta list` должен показать `Ghost (3.5.1) by glazki2`. В консоли при загрузке будет `[Ghost] loaded`. Если какая-то сигнатура не найдена, будет строка `[Ghost] ... signature not found` — отключится только эта функция.
 
 ## Диагностика
 
