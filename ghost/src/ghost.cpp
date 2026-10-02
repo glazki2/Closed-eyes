@@ -518,15 +518,7 @@ void OnGhostCommand(int iSlot)
 		return;
 	}
 	MakeGhost(iSlot);
-	PrintToChat(iSlot, CHAT_PREFIX "Ты призрак. Выйти: !unghost");
-}
-
-void OnUnGhostCommand(int iSlot)
-{
-	if (!IsGhost(iSlot))
-		return;
-	RemoveGhost(iSlot);
-	PrintToChat(iSlot, CHAT_PREFIX "Ты вышел из режима призрака");
+	PrintToChat(iSlot, CHAT_PREFIX "Ты призрак. Выйти: снова !ghost");
 }
 
 // returns true if the text (without ! or /) is a ghost command
@@ -544,11 +536,6 @@ bool RunChatCommand(int iSlot, const char* szCmd)
 	if (!V_stricmp(word, "ghost") || !V_stricmp(word, "redie"))
 	{
 		NextFrame([iSlot]() { OnGhostCommand(iSlot); });
-		return true;
-	}
-	if (!V_stricmp(word, "unghost"))
-	{
-		NextFrame([iSlot]() { OnUnGhostCommand(iSlot); });
 		return true;
 	}
 	return false;
@@ -717,7 +704,7 @@ KHook::Return<bool> Hook_FireEvent(IGameEventManager2* pThis, IGameEvent* pEvent
 KHook::Virtual<IGameEventManager2, bool, IGameEvent*, bool> g_hkFireEvent(Hook_FireEvent, nullptr);
 void* g_pGameEventManagerVTable = nullptr;
 
-// --- chat: !ghost, !redie, !unghost (and /ghost etc. without showing the message)
+// --- chat: !ghost, !redie, /ghost (never shown in chat)
 KHook::Return<void> Hook_DispatchConCommand(ICvar* pThis, ConCommandRef cmd, const CCommandContext& ctx, const CCommand& args)
 {
 	int iSlot = ctx.GetPlayerSlot().Get();
@@ -734,15 +721,15 @@ KHook::Return<void> Hook_DispatchConCommand(ICvar* pThis, ConCommandRef cmd, con
 	if (*szText != '!' && *szText != '/')
 		return {KHook::Action::Ignore};
 
-	bool bSilent = *szText == '/';
-	if (RunChatCommand(iSlot, szText + 1) && bSilent)
+	// !ghost and /ghost never show up in chat
+	if (RunChatCommand(iSlot, szText + 1))
 		return {KHook::Action::Supersede};
 
 	return {KHook::Action::Ignore};
 }
 KHook::Virtual<ICvar, void, ConCommandRef, const CCommandContext&, const CCommand&> g_hkDispatchConCommand(Hook_DispatchConCommand, nullptr);
 
-// --- client console: css_ghost / mm_ghost / css_redie / css_unghost ...
+// --- client console: css_ghost / mm_ghost / css_redie ...
 KHook::Return<void> Hook_ClientCommand(IServerGameClients* pThis, CPlayerSlot slot, const CCommand& args)
 {
 	int iSlot = slot.Get();
@@ -1081,7 +1068,7 @@ KHook::Return<int64> Hook_TakeDamage(CBaseEntity* pThis, CTakeDamageInfo* pInfo,
 	if (!g_bAnyGhostState)
 		return {KHook::Action::Ignore, 0};
 	int iVictim = GetSlotFromPawnEntity(pThis);
-	// our own silent suicide (!unghost, round end) must go through
+	// our own silent suicide (second !ghost, round end) must go through
 	if (IsValidSlot(iVictim) && g_Ghost[iVictim].bSilentDeath)
 		return {KHook::Action::Ignore, 0};
 	if (IsGhostPawn(iVictim))
