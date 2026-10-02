@@ -24,6 +24,7 @@
 #include "KeyValues.h"
 
 #include "gameevents.pb.h"
+#include "networkbasetypes.pb.h"
 #include "usermessages.pb.h"
 #include "cs_usercmd.pb.h"
 #include "cchecktransmitinfo.h"
@@ -213,6 +214,36 @@ void PrintToChat(int iSlot, const char* fmt, ...)
 	delete data;
 }
 
+// Replicated convar value for one client only (sv_footsteps 0 for the ghost: own steps and jumps
+// are predicted on the client, the server cannot filter them).
+void SendConVarValue(int iSlot, const char* szName, const char* szValue)
+{
+	if (!IsValidSlot(iSlot) || !g_pNetMessages || !g_gameEventSystem)
+		return;
+	INetworkMessageInternal* pNetMsg = g_pNetMessages->FindNetworkMessagePartial("SetConVar");
+	if (!pNetMsg)
+		return;
+	auto data = pNetMsg->AllocateMessage()->ToPB<CNETMsg_SetConVar>();
+	CMsg_CVars_CVar* cvar = data->mutable_convars()->add_cvars();
+	cvar->set_name(szName);
+	cvar->set_value(szValue);
+	CSingleRecipientFilter filter(iSlot);
+	g_gameEventSystem->PostEventAbstract(-1, false, &filter, pNetMsg, data, 0);
+	delete data;
+}
+
+void SetGhostFootsteps(int iSlot, bool bGhost)
+{
+	const char* szValue = "1";
+	if (!bGhost && g_pCVar)
+	{
+		ConVarRefAbstract ref("sv_footsteps");
+		if (ref.IsValidRef())
+			szValue = ref.GetBool() ? "1" : "0";
+	}
+	SendConVarValue(iSlot, "sv_footsteps", bGhost ? "0" : szValue);
+}
+
 CCSGameRules* GetGameRules()
 {
 	auto pProxy = (CCSGameRulesProxy*)UTIL_FindEntityByClassname("cs_gamerules");
@@ -363,6 +394,7 @@ void DeactivateGhost(int iSlot)
 	g_Ghost[iSlot].bActive = false;
 	g_Ghost[iSlot].bExpectSpawn = false;
 	g_Ghost[iSlot].bPendingRestore = true;
+	SetGhostFootsteps(iSlot, false);
 }
 
 // Leave ghost mode: the player is dead again. Silent: no kill feed, deaths/score restored.
@@ -421,6 +453,7 @@ void MakeGhost(int iSlot)
 	st.bSilentDeath = false;
 	st.flCooldownUntil = CurTime() + g_Config.flCooldown;
 	st.iTeam = pController->m_iTeamNum();
+	SetGhostFootsteps(iSlot, true);
 	st.flDyingAt = CurTime() + GHOST_DYING_DELAY;
 	st.bExpectSpawn = true;
 	st.flExpectSpawnUntil = CurTime() + 1.0f;
@@ -856,6 +889,14 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 				RemoveGhost(i);
 				continue;
 			}
+			// scoreboard: show the ghost as dead (the game rewrites these every think)
+			if (pTeamCtl)
+			{
+				if (pTeamCtl->m_bPawnIsAlive())
+					pTeamCtl->m_bPawnIsAlive = false;
+				if (pTeamCtl->m_iPawnHealth() != 0)
+					pTeamCtl->m_iPawnHealth = 0;
+			}
 			CCSPlayerPawn* pPawn = GetPawn(i);
 			if (!pPawn)
 				continue;
@@ -952,11 +993,8 @@ KHook::Return<void> Hook_PostEventAbstract(IGameEventSystem* pThis, CSplitScreen
 	if (!IsGhostPawn(iSlot))
 		return {KHook::Action::Ignore};
 
-	uint64* pClients = const_cast<uint64*>(clients);
-	*pClients &= (1ull << iSlot);
-	if (*pClients == 0)
-		return {KHook::Action::Supersede};
-	return {KHook::Action::Ignore};
+	// nobody hears a ghost body, the ghost included (steps, jumps, landing)
+	return {KHook::Action::Supersede};
 }
 KHook::Virtual<IGameEventSystem, void, CSplitScreenSlot, bool, int, const uint64*, INetworkMessageInternal*, const CNetMessage*, unsigned long, NetChannelBufType_t>
 	g_hkPostEventAbstract(Hook_PostEventAbstract, nullptr);
