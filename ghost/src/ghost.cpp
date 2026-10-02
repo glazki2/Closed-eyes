@@ -81,7 +81,6 @@ struct GhostConfig
 
 	std::string szSigSetPawn = "55 48 8D 87 ? ? ? ? 48 89 E5 41 57 41 56 41 89 CE 41 55 45 89 CD";
 	std::string szSigTakeDamage = "55 66 0F EF C0 48 89 E5 41 57 41 56 41 55 49 89 FD 31 FF";
-	std::string szSigCanAcquire = "55 48 89 E5 41 57 41 56 49 89 F6 41 55 41 54 49 89 CC 53 48 89 FB 48 83 EC ? 4C 8B 6F";
 	std::string szSigFindUseEntity = "48 B9 ? ? ? ? ? ? ? ? 55 48 89 E5 41 57 49 89 FF";
 	std::string szSigFireOutput = "55 48 89 E5 41 57 49 89 FF 41 56 41 55 41 54 49 89 D4 53 48 89 F3 48 81 EC ? ? ? ? 48 8D 05";
 	std::string szSigProcessUsercmds = "";
@@ -104,7 +103,9 @@ struct GhostState
 	float flCooldownUntil = 0.0f;
 	float flDyingAt = 0.0f;        // when LIFE_DYING may be set
 	float flExpectSpawnUntil = 0.0f;
-	float flSilentUntil = 0.0f;    // fallback "kill" in flight: its death is ours
+	float flSilentUntil = 0.0f;
+	float flArmedSince = 0.0f;     // ghost holds a weapon since (0 = unarmed)
+	float flNextDrop = 0.0f;    // fallback "kill" in flight: its death is ours
 	int iSavedScore = 0;
 	int iSavedDeaths = 0;
 	int iTeam = 0;                 // team the ghost was made in
@@ -292,8 +293,9 @@ void ApplyGhost(int iSlot)
 	if (!pPawn)
 		return;
 
-	// no weapons (spawn loadout included)
-	StripWeapons(pPawn);
+	// spawn loadout only; anything picked up later is dropped back in Hook_GameFrame
+	if (CurTime() < g_Ghost[iSlot].flDyingAt + 0.5f)
+		StripWeapons(pPawn);
 
 	if (pPawn->m_bTakesDamage())
 		pPawn->m_bTakesDamage(false);
@@ -747,6 +749,9 @@ KHook::Return<void> Hook_ClientCommand(IServerGameClients* pThis, CPlayerSlot sl
 		return {KHook::Action::Ignore};
 
 	const char* szCmd = args.Arg(0);
+	// a ghost cannot buy (buy menu and binds send these)
+	if (IsGhost(iSlot) && (!V_strnicmp(szCmd, "buy", 3) || !V_stricmp(szCmd, "autobuy") || !V_stricmp(szCmd, "rebuy")))
+		return {KHook::Action::Supersede};
 	if (!V_strnicmp(szCmd, "css_", 4) || !V_strnicmp(szCmd, "mm_", 3))
 	{
 		const char* szName = strchr(szCmd, '_') + 1;
@@ -900,6 +905,27 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 			CCSPlayerPawn* pPawn = GetPawn(i);
 			if (!pPawn)
 				continue;
+			// picked something up (walking over it): drop it back at once, so nothing is
+			// destroyed; strip only if dropping did not work within a second
+			CCSPlayer_WeaponServices* pWS = pPawn->m_pWeaponServices();
+			int nWeapons = pWS ? pWS->m_hMyWeapons()->Count() : 0;
+			if (nWeapons > 0 && flNow > st.flDyingAt + 0.5f)
+			{
+				if (st.flArmedSince == 0.0f)
+					st.flArmedSince = flNow;
+				if (flNow - st.flArmedSince > 1.0f)
+				{
+					StripWeapons(pPawn);
+					st.flArmedSince = 0.0f;
+				}
+				else if (flNow >= st.flNextDrop)
+				{
+					engine->ClientCommand(CPlayerSlot(i), "drop");
+					st.flNextDrop = flNow + 0.1f;
+				}
+			}
+			else
+				st.flArmedSince = 0.0f;
 			if (bReapply || flNow < st.flDyingAt + 0.5f)
 				ApplyGhost(i);
 		}
@@ -954,8 +980,17 @@ KHook::Return<void> Hook_CheckTransmit(ISource2GameEntities* pThis, CCheckTransm
 		auto pInfo = (CCheckTransmitInfoExtended*)ppInfoList[i];
 		int iViewer = pInfo->m_nPlayerSlot.Get();
 		CCSPlayerController* pViewer = CCSPlayerController::FromSlot(iViewer);
-		if (!pViewer || pViewer->GetPawnState() == STATE_OBSERVER_MODE)
+		if (!pViewer)
 			continue;
+		// spectators do not get the ghost either (they would hear its steps), unless they
+		// are watching exactly this pawn: an observer target must stay networked
+		CBaseEntity* pObsTarget = nullptr;
+		if (pViewer->GetPawnState() == STATE_OBSERVER_MODE)
+		{
+			CBasePlayerPawn* pViewPawn = pViewer->GetPawn();
+			CPlayer_ObserverServices* pObs = pViewPawn ? pViewPawn->m_pObserverServices() : nullptr;
+			pObsTarget = pObs ? pObs->m_hObserverTarget().Get() : nullptr;
+		}
 
 		for (int k = 0; k < nHidden; k++)
 		{
@@ -963,7 +998,7 @@ KHook::Return<void> Hook_CheckTransmit(ISource2GameEntities* pThis, CCheckTransm
 			if (j == iViewer)
 				continue; // always transmit to themselves
 			CCSPlayerPawn* pPawn = GetPawn(j);
-			if (!pPawn)
+			if (!pPawn || (CBaseEntity*)pPawn == pObsTarget)
 				continue;
 			int iIndex = pPawn->entindex();
 			pInfo->m_pTransmitEntity->Clear(iIndex);
@@ -1020,38 +1055,6 @@ KHook::Return<int64> Hook_TakeDamage(CBaseEntity* pThis, CTakeDamageInfo* pInfo,
 }
 KHook::Member<CBaseEntity, int64, CTakeDamageInfo*, CTakeDamageResult*> g_hkTakeDamage(Hook_TakeDamage, nullptr);
 
-// pickup / buy
-enum class AcquireMethod : int
-{
-	PickUp,
-	Buy,
-};
-enum class AcquireResult : int
-{
-	Allowed,
-	InvalidItem,
-	AlreadyOwned,
-	AlreadyPurchased,
-	ReachedGrenadeTypeLimit,
-	ReachedGrenadeTotalLimit,
-	NotAllowedByTeam,
-	NotAllowedByMap,
-	NotAllowedByMode,
-	NotAllowedForPurchase,
-	NotAllowedByProhibition,
-};
-KHook::Return<AcquireResult> Hook_CanAcquire(CCSPlayer_ItemServices* pThis, CEconItemView* pItem, AcquireMethod eMethod, uint64_t unk)
-{
-	if (!g_bAnyGhostState || !pThis)
-		return {KHook::Action::Ignore, AcquireResult::Allowed};
-	CCSPlayerPawn* pPawn = pThis->GetPawn();
-	int iSlot = GetSlotFromPawnEntity(pPawn);
-	// a ghost body (alive ghost or a hidden body after round end), but never a real respawned player
-	if (IsGhostPawn(iSlot) && (g_Ghost[iSlot].bActive || pPawn->m_lifeState() == LifeState_t::LIFE_DYING))
-		return {KHook::Action::Supersede, AcquireResult::NotAllowedByMode};
-	return {KHook::Action::Ignore, AcquireResult::Allowed};
-}
-KHook::Member<CCSPlayer_ItemServices, AcquireResult, CEconItemView*, AcquireMethod, uint64_t> g_hkCanAcquire(Hook_CanAcquire, nullptr);
 
 // +use target search: a ghost never finds anything to use (doors, buttons, weapons, C4, hostages)
 class CCSPlayer_UseServices;
@@ -1135,7 +1138,6 @@ void LoadConfig()
 	g_Config.iOffStripWeapons = hKv->GetInt("offset_stripweapons", g_Config.iOffStripWeapons);
 	g_Config.szSigSetPawn = hKv->GetString("sig_setpawn", g_Config.szSigSetPawn.c_str());
 	g_Config.szSigTakeDamage = hKv->GetString("sig_takedamage", g_Config.szSigTakeDamage.c_str());
-	g_Config.szSigCanAcquire = hKv->GetString("sig_canacquire", g_Config.szSigCanAcquire.c_str());
 	g_Config.szSigFindUseEntity = hKv->GetString("sig_findusentity", g_Config.szSigFindUseEntity.c_str());
 	g_Config.szSigFireOutput = hKv->GetString("sig_fireoutput", g_Config.szSigFireOutput.c_str());
 	g_Config.szSigProcessUsercmds = hKv->GetString("sig_processusercmds", g_Config.szSigProcessUsercmds.c_str());
@@ -1214,7 +1216,6 @@ bool GhostPlugin::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, b
 
 	UTIL_SetPawn = (decltype(UTIL_SetPawn))FindSignature(libserver, g_Config.szSigSetPawn, "CBasePlayerController::SetPawn", "respawn from spectator may fail");
 	SetupDetour(g_hkTakeDamage, libserver, g_Config.szSigTakeDamage, "CBaseEntity::TakeDamageOld", "damage to/from ghosts is not blocked");
-	SetupDetour(g_hkCanAcquire, libserver, g_Config.szSigCanAcquire, "CanAcquire", "pickup/buy are not blocked");
 	SetupDetour(g_hkFindUseEntity, libserver, g_Config.szSigFindUseEntity, "FindUseEntity", "+use is not blocked");
 	SetupDetour(g_hkFireOutput, libserver, g_Config.szSigFireOutput, "FireOutputInternal", "triggers/buttons activated by a ghost still fire");
 	SetupDetour(g_hkProcessUsercmds, libserver, g_Config.szSigProcessUsercmds, "ProcessUsercmds", "buttons are not stripped from user commands");
