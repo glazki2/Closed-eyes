@@ -79,6 +79,7 @@ public:
 	SCHEMA_FIELD(GameTime_t, m_flHealthShotBoostExpirationTime);
 	SCHEMA_FIELD(int32, m_ArmorValue);
 	SCHEMA_FIELD(bool, m_bInBuyZone);
+	SCHEMA_FIELD(bool, m_bIsDefusing);
 	SCHEMA_FIELD(EntitySpottedState_t, m_entitySpottedState)
 	SCHEMA_FIELD(int, m_aimPunchTickBase)
 	SCHEMA_FIELD(float, m_aimPunchTickFraction)

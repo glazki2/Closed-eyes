@@ -24,7 +24,6 @@
 #include "KeyValues.h"
 
 #include "gameevents.pb.h"
-#include "networkbasetypes.pb.h"
 #include "usermessages.pb.h"
 #include "cs_usercmd.pb.h"
 #include "cchecktransmitinfo.h"
@@ -62,8 +61,9 @@ CGlobalVars* gpGlobals = nullptr;
 
 #define GHOST_BLOCKED_BUTTONS (IN_ATTACK | IN_USE | IN_ATTACK2 | IN_RELOAD)
 
-// LIFE_DYING right after respawn gives the player a black screen
-#define GHOST_DYING_DELAY 0.25f
+// right after our respawn the ghost state is re-applied every tick for this long
+// (the game hands out the spawn loadout a little later than Respawn() returns)
+#define GHOST_SPAWN_WINDOW 0.75f
 #define GHOST_REAPPLY_INTERVAL 0.5f
 
 ///////////////////////////////////////
@@ -101,18 +101,21 @@ struct GhostState
 	bool bSavedCollision = false;
 	uint64_t nSavedInteractsAs = 0;
 	float flCooldownUntil = 0.0f;
-	float flDyingAt = 0.0f;        // when LIFE_DYING may be set
+	float flSpawnWindowEnd = 0.0f; // spawn loadout is stripped until then
 	float flExpectSpawnUntil = 0.0f;
-	float flSilentUntil = 0.0f;
+	float flSilentUntil = 0.0f;    // a death until then is ours (fallback "kill", team change): hide it, give the score back
 	float flArmedSince = 0.0f;     // ghost holds a weapon since (0 = unarmed)
-	float flNextDrop = 0.0f;    // fallback "kill" in flight: its death is ours
+	float flNextDrop = 0.0f;
 	int iSavedScore = 0;
 	int iSavedDeaths = 0;
+	int iSavedMoney = -1;          // money when the ghost was made: a ghost never spends anything
 	int iTeam = 0;                 // team the ghost was made in
 };
 
 GhostState g_Ghost[MAX_SLOTS];
 bool g_bRoundActive = true; // late load mid-round: allow until the next map start
+float g_flRestartAtRoundStart = -1.0f;
+float g_flLastRoundStart = -1.0f;      // m_fRoundStartTime seen last tick (changes when a new round starts) // m_flRestartRoundTime seen at round start (a stale value is not a round end)
 bool g_bAnyGhostState = false;
 bool g_bEnabled = true;
 bool g_bDebug = false;
@@ -144,6 +147,14 @@ void RefreshGlobals()
 void NextFrame(std::function<void()> fn)
 {
 	g_NextFrame.push_back(std::move(fn));
+}
+
+// O(1) lookup through the entity system (never walk the whole entity list)
+CEntityInstance* EntityByIndex(int iIndex)
+{
+	if (!g_pEntitySystem || iIndex < 0 || iIndex >= MAX_EDICTS)
+		return nullptr;
+	return g_pEntitySystem->GetEntityInstance(CEntityIndex(iIndex));
 }
 
 CCSPlayerPawn* GetPawn(int iSlot)
@@ -216,40 +227,57 @@ void PrintToChat(int iSlot, const char* fmt, ...)
 	delete data;
 }
 
-// Replicated convar value for one client only (sv_footsteps 0 for the ghost: own steps and jumps
-// are predicted on the client, the server cannot filter them).
-void SendConVarValue(int iSlot, const char* szName, const char* szValue)
-{
-	if (!IsValidSlot(iSlot) || !g_pNetMessages || !g_gameEventSystem)
-		return;
-	INetworkMessageInternal* pNetMsg = g_pNetMessages->FindNetworkMessagePartial("SetConVar");
-	if (!pNetMsg)
-		return;
-	auto data = pNetMsg->AllocateMessage()->ToPB<CNETMsg_SetConVar>();
-	CMsg_CVars_CVar* cvar = data->mutable_convars()->add_cvars();
-	cvar->set_name(szName);
-	cvar->set_value(szValue);
-	CSingleRecipientFilter filter(iSlot);
-	g_gameEventSystem->PostEventAbstract(-1, false, &filter, pNetMsg, data, 0);
-	delete data;
-}
+// cs_gamerules is looked up once per map and cached (it was a full entity list walk every tick)
+CEntityHandle g_hGameRulesProxy;
+int g_nRulesSearchSkip = 0;
 
-void SetGhostFootsteps(int iSlot, bool bGhost)
+void ResetGameRulesCache()
 {
-	const char* szValue = "1";
-	if (!bGhost && g_pCVar)
-	{
-		ConVarRefAbstract ref("sv_footsteps");
-		if (ref.IsValidRef())
-			szValue = ref.GetBool() ? "1" : "0";
-	}
-	SendConVarValue(iSlot, "sv_footsteps", bGhost ? "0" : szValue);
+	g_hGameRulesProxy = CEntityHandle();
+	g_nRulesSearchSkip = 0;
 }
 
 CCSGameRules* GetGameRules()
 {
-	auto pProxy = (CCSGameRulesProxy*)UTIL_FindEntityByClassname("cs_gamerules");
-	return pProxy ? pProxy->m_pGameRules() : nullptr;
+	if (!g_pEntitySystem)
+		return nullptr;
+	CEntityInstance* pEnt = g_hGameRulesProxy.IsValid() ? g_pEntitySystem->GetEntityInstance(g_hGameRulesProxy) : nullptr;
+	if (!pEnt || !pEnt->GetClassname() || strcmp(pEnt->GetClassname(), "cs_gamerules"))
+	{
+		pEnt = nullptr;
+		if (g_nRulesSearchSkip > 0)
+		{
+			g_nRulesSearchSkip--;
+			return nullptr;
+		}
+		for (int i = 0; i < 4096 && !pEnt; i++)
+		{
+			CEntityInstance* pCandidate = EntityByIndex(i);
+			const char* szClass = pCandidate ? pCandidate->GetClassname() : nullptr;
+			if (szClass && !strcmp(szClass, "cs_gamerules"))
+				pEnt = pCandidate;
+		}
+		if (!pEnt)
+		{
+			g_nRulesSearchSkip = 64; // not created yet (map loading): retry in a second
+			return nullptr;
+		}
+		g_hGameRulesProxy = pEnt->GetRefEHandle();
+	}
+	return ((CCSGameRulesProxy*)pEnt)->m_pGameRules();
+}
+
+int GetMoney(CCSPlayerController* pController)
+{
+	CCSPlayerController_InGameMoneyServices* pMoney = pController ? pController->m_pInGameMoneyServices() : nullptr;
+	return pMoney ? pMoney->m_iAccount() : -1;
+}
+
+void SetMoney(CCSPlayerController* pController, int iMoney)
+{
+	CCSPlayerController_InGameMoneyServices* pMoney = pController ? pController->m_pInGameMoneyServices() : nullptr;
+	if (pMoney && iMoney >= 0)
+		pMoney->m_iAccount = iMoney;
 }
 
 ///////////////////////////////////////
@@ -295,11 +323,15 @@ void ApplyGhost(int iSlot)
 		return;
 
 	// spawn loadout only; anything picked up later is dropped back in Hook_GameFrame
-	if (CurTime() < g_Ghost[iSlot].flDyingAt + 0.5f)
+	if (CurTime() < g_Ghost[iSlot].flSpawnWindowEnd)
 		StripWeapons(pPawn);
 
 	if (pPawn->m_bTakesDamage())
 		pPawn->m_bTakesDamage(false);
+
+	// bots do not target a ghost
+	if (!(pPawn->m_fFlags() & FL_NOTARGET))
+		pPawn->m_fFlags = pPawn->m_fFlags() | FL_NOTARGET;
 
 	// Intangible: knife/bullet/grenade traces and triggers ignore the pawn,
 	// movement still collides with the world (m_nInteractsWith untouched).
@@ -331,7 +363,7 @@ void ApplyGhost(int iSlot)
 		pPawn->m_clrRender = Color(255, 255, 255, 0);
 
 	// The pawn stays LIFE_ALIVE: any other life state gives the ghost a black screen.
-	// Round end by elimination is handled in CheckTeamsEliminated().
+	// Round end by elimination is handled in CheckTeamsEliminated(), the scoreboard in Hook_GameFrame.
 }
 
 // Player interaction layers must never stay 0 on a normal player: that would make him unhittable.
@@ -375,6 +407,8 @@ void RestorePawn(int iSlot)
 		pPawn->m_nRenderMode = kRenderNormal;
 		pPawn->m_clrRender = Color(255, 255, 255, 255);
 		pPawn->m_bTakesDamage(true);
+		if (pPawn->m_fFlags() & FL_NOTARGET)
+			pPawn->m_fFlags = pPawn->m_fFlags() & ~(uint32)FL_NOTARGET;
 	}
 	g_Ghost[iSlot].bPendingRestore = false;
 	g_Ghost[iSlot].bSavedCollision = false;
@@ -397,7 +431,6 @@ void DeactivateGhost(int iSlot)
 	g_Ghost[iSlot].bActive = false;
 	g_Ghost[iSlot].bExpectSpawn = false;
 	g_Ghost[iSlot].bPendingRestore = true;
-	SetGhostFootsteps(iSlot, false);
 }
 
 // Leave ghost mode: the player is dead again. Silent: no kill feed, deaths/score restored.
@@ -456,8 +489,9 @@ void MakeGhost(int iSlot)
 	st.bSilentDeath = false;
 	st.flCooldownUntil = CurTime() + g_Config.flCooldown;
 	st.iTeam = pController->m_iTeamNum();
-	SetGhostFootsteps(iSlot, true);
-	st.flDyingAt = CurTime() + GHOST_DYING_DELAY;
+	st.iSavedMoney = GetMoney(pController);
+	st.flSilentUntil = 0.0f;
+	st.flSpawnWindowEnd = CurTime() + GHOST_SPAWN_WINDOW;
 	st.bExpectSpawn = true;
 	st.flExpectSpawnUntil = CurTime() + 1.0f;
 	g_bAnyGhostState = true;
@@ -465,8 +499,21 @@ void MakeGhost(int iSlot)
 	RespawnPlayer(pController);
 
 	NextFrame([iSlot]() {
-		if (IsGhost(iSlot))
-			ApplyGhost(iSlot);
+		if (!IsGhost(iSlot))
+			return;
+		CCSPlayerPawn* pPawn = GetPawn(iSlot);
+		if (!pPawn || pPawn->m_lifeState() != LifeState_t::LIFE_ALIVE)
+		{
+			// respawn failed (offset/signature out of date): do not leave a "ghost" that is dead
+			Warning("[Ghost] respawn of slot %d failed, check offset_respawn / sig_setpawn\n", iSlot);
+			g_Ghost[iSlot].bActive = false;
+			g_Ghost[iSlot].bExpectSpawn = false;
+			g_Ghost[iSlot].flCooldownUntil = 0.0f;
+			PrintToChat(iSlot, CHAT_PREFIX "Не получилось стать призраком");
+			return;
+		}
+		ApplyGhost(iSlot);
+		PrintToChat(iSlot, CHAT_PREFIX "Ты призрак. Выйти: снова !ghost");
 	});
 }
 
@@ -504,11 +551,22 @@ void OnGhostCommand(int iSlot)
 	if (pRules && pRules->m_bWarmupPeriod())
 	{
 		Msg("[Ghost] slot %d: refused, warmup\n", iSlot);
-		PrintToChat(iSlot, CHAT_PREFIX "Сейчас нельзя: разминка или раунд не идёт");
+		PrintToChat(iSlot, CHAT_PREFIX "Сейчас нельзя: разминка");
+		return;
+	}
+	if (!g_bRoundActive)
+	{
+		Msg("[Ghost] slot %d: refused, round is over\n", iSlot);
+		PrintToChat(iSlot, CHAT_PREFIX "Сейчас нельзя: раунд закончился");
 		return;
 	}
 	CCSPlayerPawn* pPawn = pController->GetPlayerPawn();
-	if (!pPawn || pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE)
+	if (!pPawn)
+	{
+		PrintToChat(iSlot, CHAT_PREFIX "Сейчас нельзя: дождись появления в команде");
+		return;
+	}
+	if (pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE)
 	{
 		PrintToChat(iSlot, CHAT_PREFIX "Только для мёртвых игроков");
 		return;
@@ -519,7 +577,6 @@ void OnGhostCommand(int iSlot)
 		return;
 	}
 	MakeGhost(iSlot);
-	PrintToChat(iSlot, CHAT_PREFIX "Ты призрак. Выйти: снова !ghost");
 }
 
 // returns true if the text (without ! or /) is a ghost command
@@ -570,7 +627,8 @@ CON_COMMAND_F(mm_ghost_status, "Show ghost plugin status (server console)", FCVA
 	for (int i = 0; i < MAX_SLOTS; i++)
 		if (IsGhost(i))
 			nGhosts++;
-	Msg("[Ghost] %s, ghosts: %d, round active: %d, blocked ghost sounds: %d\n", g_bEnabled ? "enabled" : "disabled", nGhosts, g_bRoundActive, g_nBlockedSounds);
+	Msg("[Ghost] %s, version %s, ghosts: %d, round active: %d, blocked ghost sounds: %d, game rules found: %d\n", g_bEnabled ? "enabled" : "disabled",
+		PLUGIN_FULL_VERSION, nGhosts, g_bRoundActive, g_nBlockedSounds, GetGameRules() != nullptr);
 }
 
 ///////////////////////////////////////
@@ -579,6 +637,8 @@ CON_COMMAND_F(mm_ghost_status, "Show ghost plugin status (server console)", FCVA
 void OnRoundStart()
 {
 	g_bRoundActive = true;
+	if (CCSGameRules* pRules = GetGameRules())
+		g_flRestartAtRoundStart = pRules->m_flRestartRoundTime().GetTime();
 	for (int i = 0; i < MAX_SLOTS; i++)
 	{
 		DeactivateGhost(i);
@@ -700,16 +760,25 @@ KHook::Return<bool> Hook_FireEvent(IGameEventManager2* pThis, IGameEvent* pEvent
 			return KHook::Recall<bool (IGameEventManager2::*)(IGameEvent*, bool)>(nullptr, {KHook::Action::Ignore, false}, pThis, pEvent, true);
 	}
 	else if (!strcmp(szName, "player_footstep") || !strcmp(szName, "player_jump") || !strcmp(szName, "player_sound")
-			 || !strcmp(szName, "weapon_zoom") || !strcmp(szName, "player_falldamage"))
+			 || !strcmp(szName, "player_falldamage"))
 	{
-		// movement noise of a ghost (radar footstep marks, client sound cues) never reaches clients
+		// movement noise of a ghost never reaches clients (radar marks, sound cues).
+		// The event itself is not destroyed: other plugins hooking FireEvent still get a valid pointer.
 		int iSlot = pEvent->GetPlayerSlot("userid").Get();
-		if (IsGhostPawn(iSlot) && !bDontBroadcast)
+		if (IsGhost(iSlot) && !bDontBroadcast)
 		{
 			if (g_bDebug)
 				Msg("[Ghost] debug: hid event %s of slot %d\n", szName, iSlot);
 			return KHook::Recall<bool (IGameEventManager2::*)(IGameEvent*, bool)>(nullptr, {KHook::Action::Ignore, false}, pThis, pEvent, true);
 		}
+	}
+	else if (!strcmp(szName, "bomb_pickup") || !strcmp(szName, "bomb_dropped") || !strcmp(szName, "item_pickup") || !strcmp(szName, "item_remove"))
+	{
+		// a ghost that walked over something drops it at once: clients never learn about it
+		// ("X picked up the bomb"); server-side listeners (bots) still keep track of the bomb
+		int iSlot = pEvent->GetPlayerSlot("userid").Get();
+		if (IsGhost(iSlot) && !bDontBroadcast)
+			return KHook::Recall<bool (IGameEventManager2::*)(IGameEvent*, bool)>(nullptr, {KHook::Action::Ignore, false}, pThis, pEvent, true);
 	}
 	else if (!strcmp(szName, "player_spawn"))
 		OnPlayerSpawn(pEvent->GetPlayerSlot("userid").Get());
@@ -792,6 +861,9 @@ KHook::Return<void> Hook_StartupServer(INetworkServerService* pThis, const GameS
 	g_bAnyGhostState = false;
 	g_flNextReapply = 0.0f;
 	g_NextFrame.clear();
+	ResetGameRulesCache();
+	g_flLastRoundStart = -1.0f;
+	g_flRestartAtRoundStart = -1.0f;
 	return {KHook::Action::Ignore};
 }
 KHook::Virtual<INetworkServerService, void, const GameSessionConfiguration_t&, ISource2WorldSession*, const char*> g_hkStartupServer(nullptr, Hook_StartupServer);
@@ -816,8 +888,9 @@ void CheckTeamsEliminated()
 			nGhosts[iTeam]++;
 			continue;
 		}
+		// alive and not a ghost = real player (a pending body that is alive again was respawned by the game)
 		CCSPlayerPawn* pPawn = pController->GetPlayerPawn();
-		if (pPawn && pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE && !g_Ghost[i].bPendingRestore)
+		if (pPawn && pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE && g_Ghost[i].flSilentUntil <= CurTime())
 			nReal[iTeam]++;
 	}
 	for (int iTeam = 2; iTeam <= 3; iTeam++)
@@ -836,17 +909,59 @@ void CheckTeamsEliminated()
 	}
 }
 
+// Dead players must not spectate a ghost (they would see and hear it through its eyes):
+// switch their camera to a real player.
+void MoveSpectatorsOffGhosts()
+{
+	for (int v = 0; v < MAX_SLOTS; v++)
+	{
+		CCSPlayerController* pViewer = CCSPlayerController::FromSlot(v);
+		if (!pViewer || pViewer->GetPawnState() != STATE_OBSERVER_MODE)
+			continue;
+		CBasePlayerPawn* pObsPawn = pViewer->GetPawn();
+		CPlayer_ObserverServices* pObs = pObsPawn ? pObsPawn->m_pObserverServices() : nullptr;
+		if (!pObs)
+			continue;
+		CBaseEntity* pTarget = pObs->m_hObserverTarget().Get();
+		if (!pTarget || !IsGhost(GetSlotFromPawnEntity(pTarget)))
+			continue;
+
+		// another alive real player, a teammate first (mp_forcecamera)
+		CCSPlayerPawn* pBest = nullptr;
+		for (int pass = 0; pass < 2 && !pBest; pass++)
+		{
+			for (int i = 0; i < MAX_SLOTS && !pBest; i++)
+			{
+				if (i == v || IsGhostPawn(i))
+					continue;
+				CCSPlayerController* pOther = CCSPlayerController::FromSlot(i);
+				CCSPlayerPawn* pPawn = pOther ? pOther->GetPlayerPawn() : nullptr;
+				if (!pPawn || pPawn->m_lifeState() != LifeState_t::LIFE_ALIVE)
+					continue;
+				if (pass == 0 && pOther->m_iTeamNum() != pViewer->m_iTeamNum())
+					continue;
+				pBest = pPawn;
+			}
+		}
+		if (pBest)
+			pObs->m_hObserverTarget = CHandle<CBaseEntity>((CBaseEntity*)pBest);
+	}
+}
+
 // round_end without the event hook: the game sets the next round restart time when the round ends
 void CheckRoundEndFallback()
 {
 	if (!g_bRoundActive)
 		return;
 	CCSGameRules* pRules = GetGameRules();
-	if (pRules && pRules->m_flRestartRoundTime().GetTime() > CurTime())
+	if (!pRules)
+		return;
+	float flRestart = pRules->m_flRestartRoundTime().GetTime();
+	if (flRestart > CurTime() && flRestart != g_flRestartAtRoundStart)
 		OnRoundEnd();
 }
 
-// --- per tick: next-frame queue, re-apply ghost state, LIFE_DYING after the delay, restore respawned players
+// --- per tick: next-frame queue, round tracking, re-apply ghost state, restore respawned players
 KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool bFirstTick, bool bLastTick)
 {
 	// the entity system is recreated on map change: never keep a stale pointer
@@ -855,18 +970,15 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 		return {KHook::Action::Ignore};
 
 	// round start fallback: works even if the FireEvent hook never fires
-	static float s_flLastRoundStart = -1.0f;
 	if (CCSGameRules* pRules = GetGameRules())
 	{
 		float t = pRules->m_fRoundStartTime().GetTime();
-		if (t != s_flLastRoundStart)
+		if (t != g_flLastRoundStart)
 		{
-			bool bFirst = s_flLastRoundStart < 0.0f;
-			s_flLastRoundStart = t;
-			if (!bFirst && !g_bRoundActive)
+			bool bFirst = g_flLastRoundStart < 0.0f; // plugin load / new map: a round is going on
+			g_flLastRoundStart = t;
+			if (bFirst || !g_bRoundActive)
 				OnRoundStart();
-			else if (bFirst)
-				g_bRoundActive = true;
 		}
 	}
 
@@ -878,11 +990,13 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 			fn();
 	}
 
+	CheckRoundEndFallback();
+
 	if (!g_bAnyGhostState)
 		return {KHook::Action::Ignore};
 
-	CheckRoundEndFallback();
 	CheckTeamsEliminated();
+	MoveSpectatorsOffGhosts();
 
 	float flNow = CurTime();
 	bool bReapply = flNow >= g_flNextReapply;
@@ -914,11 +1028,33 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 			CCSPlayerPawn* pPawn = GetPawn(i);
 			if (!pPawn)
 				continue;
+			// a ghost cannot defuse (backup for when the +use signature is not found)
+			if (pPawn->m_bIsDefusing())
+			{
+				Msg("[Ghost] slot %d started defusing, leaving ghost mode\n", i);
+				RemoveGhost(i);
+				PrintToChat(i, CHAT_PREFIX "Призрак не может разминировать бомбу");
+				continue;
+			}
+			if (pPawn->m_bInBuyZone())
+				pPawn->m_bInBuyZone = false;
+			// a ghost never spends money: if something was bought anyway, take it away and refund
+			int iMoney = GetMoney(pTeamCtl);
+			if (iMoney >= 0 && st.iSavedMoney >= 0 && iMoney < st.iSavedMoney)
+			{
+				Msg("[Ghost] slot %d bought something as a ghost, refunded\n", i);
+				StripWeapons(pPawn);
+				SetMoney(pTeamCtl, st.iSavedMoney);
+				st.flArmedSince = 0.0f;
+				continue;
+			}
+			if (iMoney > st.iSavedMoney)
+				st.iSavedMoney = iMoney;
 			// picked something up (walking over it): drop it back at once, so nothing is
 			// destroyed; strip only if dropping did not work within a second
 			CCSPlayer_WeaponServices* pWS = pPawn->m_pWeaponServices();
 			int nWeapons = pWS ? pWS->m_hMyWeapons()->Count() : 0;
-			if (nWeapons > 0 && flNow > st.flDyingAt + 0.5f)
+			if (nWeapons > 0 && flNow > st.flSpawnWindowEnd)
 			{
 				if (st.flArmedSince == 0.0f)
 					st.flArmedSince = flNow;
@@ -935,7 +1071,7 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 			}
 			else
 				st.flArmedSince = 0.0f;
-			if (bReapply || flNow < st.flDyingAt + 0.5f)
+			if (bReapply || flNow < st.flSpawnWindowEnd)
 				ApplyGhost(i);
 		}
 		else if (st.bPendingRestore)
@@ -943,7 +1079,7 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 			CCSPlayerPawn* pPawn = GetPawn(i);
 			if (!pPawn)
 				continue;
-			// ghost body after round end / unghost is DYING or DEAD; ALIVE means the game respawned the player
+			// the body after leaving ghost mode is dead; ALIVE means the game (or a plugin) respawned the player
 			if (st.flSilentUntil > 0.0f && pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE)
 			{
 				// waiting for the fallback "kill"; if it never came, he is still a ghost
@@ -959,8 +1095,6 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 			}
 			else if (pPawn->m_lifeState() == LifeState_t::LIFE_ALIVE)
 				RestorePawn(i);
-			else if (bReapply && pPawn->m_lifeState() == LifeState_t::LIFE_DYING)
-				StripWeapons(pPawn);
 		}
 	}
 	UpdateAnyGhostState();
@@ -968,8 +1102,9 @@ KHook::Return<void> Hook_GameFrame(IServerGameDLL* pThis, bool simulating, bool 
 }
 KHook::Virtual<IServerGameDLL, void, bool, bool, bool> g_hkGameFrame(nullptr, Hook_GameFrame);
 
-// --- others do not receive the ghost pawn at all: no model, shadow, radar, footsteps.
-// Spectators are left alone (pawn is NODRAW/LIFE_DYING anyway).
+// --- others do not receive the ghost pawn at all: no model, shadow, radar, name, client-side sounds.
+// Spectators neither, except one who is watching exactly this pawn (MoveSpectatorsOffGhosts moves
+// such a camera away on the next tick; an observer target itself must stay networked).
 KHook::Return<void> Hook_CheckTransmit(ISource2GameEntities* pThis, CCheckTransmitInfo** ppInfoList, int infoCount, CBitVec<16384>& unionTransmitEdicts,
 									   CBitVec<16384>& unk, const Entity2Networkable_t** pNetworkables, const uint16* pEntityIndicies, int nEntities)
 {
@@ -1020,29 +1155,43 @@ KHook::Virtual<ISource2GameEntities, void, CCheckTransmitInfo**, int, CBitVec<16
 	g_hkCheckTransmit(nullptr, Hook_CheckTransmit);
 
 // --- footsteps / jump / land sounds of a ghost: nobody hears them, the ghost included.
-// The engine has several send paths, all of them are covered.
+// CS2 plays every footstep on the server (mp_footsteps_serverside, default true) and sends it
+// as GE_SosStartSoundEvent with the pawn as source. The message is recognised by its id and the
+// source entity is looked up directly by index (both like CS2Fixes does it).
 int g_nBlockedSounds = 0;
+
+// slot of the ghost body that made a sound: the pawn itself or something it owns
+int GetSoundGhostSlot(CEntityInstance* pSource)
+{
+	if (!pSource)
+		return -1;
+	int iSlot = GetSlotFromPawnEntity(pSource);
+	if (iSlot == -1)
+	{
+		CBaseEntity* pOwner = ((CBaseEntity*)pSource)->m_hOwnerEntity().Get();
+		iSlot = GetSlotFromPawnEntity(pOwner);
+	}
+	return IsGhostPawn(iSlot) ? iSlot : -1;
+}
 
 bool IsGhostSound(INetworkMessageInternal* pEvent, const CNetMessage* pData)
 {
 	if (!g_bAnyGhostState || !pEvent || !pData)
 		return false;
 	NetMessageInfo_t* info = pEvent->GetNetMessageInfo();
-	if (!info || !info->m_pBinding)
-		return false;
-	const char* szName = info->m_pBinding->GetName();
-	if (!szName || strcmp(szName, "CMsgSosStartSoundEvent"))
+	if (!info || info->m_MessageId != GE_SosStartSoundEvent)
 		return false;
 	auto msg = const_cast<CNetMessage*>(pData)->ToPB<CMsgSosStartSoundEvent>();
-	CEntityInstance* pSource = msg->has_source_entity_index() ? UTIL_GetEntityByIndex(msg->source_entity_index()) : nullptr;
-	int iSlot = GetSlotFromPawnEntity(pSource);
+	int iIndex = msg->has_source_entity_index() ? (int)msg->source_entity_index() : -1;
+	CEntityInstance* pSource = EntityByIndex(iIndex);
+	int iSlot = GetSoundGhostSlot(pSource);
 	if (g_bDebug)
-		Msg("[Ghost] debug: sound hash %u source %d (%s) slot %d ghost %d\n", msg->soundevent_hash(),
-			msg->has_source_entity_index() ? (int)msg->source_entity_index() : -1, pSource ? pSource->GetClassname() : "none", iSlot, IsGhostPawn(iSlot));
-	if (!IsGhostPawn(iSlot))
+		Msg("[Ghost] debug: sound hash %u source %d (%s) ghost slot %d%s\n", msg->soundevent_hash(), iIndex,
+			pSource && pSource->GetClassname() ? pSource->GetClassname() : "none", iSlot, iSlot != -1 ? " -> blocked" : "");
+	if (iSlot == -1)
 		return false;
 	if (g_nBlockedSounds++ == 0)
-		Msg("[Ghost] blocking ghost sounds works (slot %d)\n", iSlot);
+		Msg("[Ghost] ghost sounds are blocked (first one from slot %d)\n", iSlot);
 	return true;
 }
 
@@ -1066,16 +1215,10 @@ KHook::Return<void> Hook_PostEventAbstractFilter(IGameEventSystem* pThis, CSplit
 KHook::Virtual<IGameEventSystem, void, CSplitScreenSlot, bool, IRecipientFilter*, INetworkMessageInternal*, const CNetMessage*, unsigned long>
 	g_hkPostEventAbstractFilter(Hook_PostEventAbstractFilter, nullptr);
 
-// entity-bound events (sounds attached to the pawn)
+// entity-bound messages: only sounds are filtered (others, e.g. the view angle fix on spawn, must reach the ghost)
 KHook::Return<void> Hook_PostEntityEventAbstract(IGameEventSystem* pThis, const CBaseHandle& hndl, INetworkMessageInternal* pEvent, const CNetMessage* pData,
 												 unsigned long nSize, NetChannelBufType_t bufType)
 {
-	if (g_bAnyGhostState && hndl.IsValid() && IsGhostPawn(GetSlotFromPawnEntity(UTIL_GetEntityByIndex(hndl.GetEntryIndex()))))
-	{
-		if (g_nBlockedSounds++ == 0)
-			Msg("[Ghost] blocking ghost entity events works\n");
-		return {KHook::Action::Supersede};
-	}
 	if (IsGhostSound(pEvent, pData))
 		return {KHook::Action::Supersede};
 	return {KHook::Action::Ignore};
